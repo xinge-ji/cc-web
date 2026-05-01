@@ -2531,14 +2531,37 @@ html[data-theme='coolvibe'] .settings-back:hover {
   margin-bottom: 20px;
 }
 .import-group:last-child { margin-bottom: 0; }
-.import-group-title {
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--text-muted);
+.import-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 4px 0 8px;
   border-bottom: 1px solid var(--border-color);
   margin-bottom: 8px;
+}
+.import-group-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-muted);
   word-break: break-all;
+}
+.import-group-toggle {
+  flex-shrink: 0;
+  padding: 3px 9px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s, border-color 0.2s;
+}
+.import-group-toggle:hover {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border-color: var(--accent);
 }
 .import-item {
   display: flex;

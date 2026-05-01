@@ -196,6 +196,26 @@ WantedBy=multi-user.target
 
 `KillMode=process` is important. It ensures systemd restart only stops Node.js, while Claude subprocesses continue and are reattached after recovery.
 
+If you want to run the service directly as `root`, the config can look like this on the current machine:
+
+```ini
+[Unit]
+Description=CC-Web - Claude Code Web Chat UI
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/mnt/c/Project/cc-web
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=5
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
+```
+
 ```bash
 sudo systemctl enable cc-web
 sudo systemctl start cc-web

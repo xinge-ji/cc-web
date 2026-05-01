@@ -3179,6 +3179,46 @@ function handleMessage(ws, msg, options = {}) {
   const errorFd = fs.openSync(errorPath, 'w');
 
   let proc;
+  const entry = {
+    pid: null,
+    ws,
+    agent: getSessionAgent(session),
+    cwd: spawnSpec.cwd,
+    fullText: '',
+    attachments: resolvedAttachments,
+    toolCalls: [],
+    lastCost: null,
+    lastUsage: null,
+    lastError: null,
+    errorSent: false,
+    codexHomeDir: spawnSpec.codexHomeDir || '',
+    codexRuntimeKey: spawnSpec.codexRuntimeKey || '',
+    tailer: null,
+    spawnFailed: false,
+  };
+
+  const failProcessSpawn = (err) => {
+    if (entry.spawnFailed) return;
+    entry.spawnFailed = true;
+    entry.lastError = err?.message || String(err);
+    if (entry.tailer) entry.tailer.stop();
+    activeProcesses.delete(currentSessionId);
+    if (proc?.pid) {
+      try { killProcess(proc.pid); } catch {}
+    }
+    cleanRunDir(currentSessionId);
+    plog('ERROR', 'process_spawn_fail', {
+      sessionId: currentSessionId.slice(0, 8),
+      agent: entry.agent,
+      error: entry.lastError,
+    });
+    sendSessionList(ws);
+    wsSend(ws, {
+      type: 'error',
+      message: formatRuntimeError(entry.agent, entry.lastError, { exitCode: null, signal: null }),
+    });
+  };
+
   try {
     let stdinSource;
     if (useStreamJson) {
@@ -3204,28 +3244,49 @@ function handleMessage(ws, msg, options = {}) {
   } catch (err) {
     fs.closeSync(outputFd);
     fs.closeSync(errorFd);
-    cleanRunDir(currentSessionId);
-    plog('ERROR', 'process_spawn_fail', { sessionId: currentSessionId.slice(0, 8), error: err.message });
-    const agent = getSessionAgent(session);
-    return wsSend(ws, { type: 'error', message: formatRuntimeError(agent, err.message, { exitCode: null, signal: null }) });
+    return failProcessSpawn(err);
   }
 
   fs.closeSync(outputFd);
   fs.closeSync(errorFd);
+  proc.once('error', (err) => {
+    failProcessSpawn(err);
+  });
 
-  fs.writeFileSync(path.join(dir, 'pid'), String(proc.pid));
-  proc.unref(); // Process survives Node.js exit
+  proc.once('spawn', () => {
+    if (entry.spawnFailed) return;
+    entry.pid = proc.pid || null;
+    try {
+      fs.writeFileSync(path.join(dir, 'pid'), String(proc.pid));
+    } catch (err) {
+      failProcessSpawn(err);
+      return;
+    }
+    proc.unref(); // Process survives Node.js exit
 
-  plog('INFO', 'process_spawn', {
-    sessionId: currentSessionId.slice(0, 8),
-    pid: proc.pid,
-    agent: getSessionAgent(session),
-    mode: spawnSpec.mode,
-    model: session.model || 'default',
-    resume: spawnSpec.resume,
-    codexHomeDir: spawnSpec.codexHomeDir || null,
-    codexRuntimeKey: spawnSpec.codexRuntimeKey || null,
-    args: spawnSpec.args.join(' '),
+    plog('INFO', 'process_spawn', {
+      sessionId: currentSessionId.slice(0, 8),
+      pid: proc.pid,
+      agent: entry.agent,
+      mode: spawnSpec.mode,
+      model: session.model || 'default',
+      resume: spawnSpec.resume,
+      codexHomeDir: spawnSpec.codexHomeDir || null,
+      codexRuntimeKey: spawnSpec.codexRuntimeKey || null,
+      args: spawnSpec.args.join(' '),
+    });
+
+    activeProcesses.set(currentSessionId, entry);
+    sendSessionList(ws);
+
+    // Tail the output file for real-time streaming
+    entry.tailer = new FileTailer(outputPath, (line) => {
+      try {
+        const event = JSON.parse(line);
+        processRuntimeEvent(entry, event, currentSessionId);
+      } catch {}
+    });
+    entry.tailer.start();
   });
 
   // Fast exit detection (while Node.js is running)
@@ -3239,34 +3300,6 @@ function handleMessage(ws, msg, options = {}) {
     // Small delay to ensure file is fully flushed
     setTimeout(() => handleProcessComplete(currentSessionId, code, signal), 300);
   });
-
-  const entry = {
-    pid: proc.pid,
-    ws,
-    agent: getSessionAgent(session),
-    cwd: spawnSpec.cwd,
-    fullText: '',
-    attachments: resolvedAttachments,
-    toolCalls: [],
-    lastCost: null,
-    lastUsage: null,
-    lastError: null,
-    errorSent: false,
-    codexHomeDir: spawnSpec.codexHomeDir || '',
-    codexRuntimeKey: spawnSpec.codexRuntimeKey || '',
-    tailer: null,
-  };
-  activeProcesses.set(currentSessionId, entry);
-  sendSessionList(ws);
-
-  // Tail the output file for real-time streaming
-  entry.tailer = new FileTailer(outputPath, (line) => {
-    try {
-      const event = JSON.parse(line);
-      processRuntimeEvent(entry, event, currentSessionId);
-    } catch {}
-  });
-  entry.tailer.start();
 }
 
 function truncateObj(obj, maxLen) {
