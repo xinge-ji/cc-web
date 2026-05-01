@@ -196,7 +196,7 @@ WantedBy=multi-user.target
 
 `KillMode=process` is important. It ensures systemd restart only stops Node.js, while Claude subprocesses continue and are reattached after recovery.
 
-If you want to run the service directly as `root`, the config can look like this on the current machine:
+If you want to run the service directly as `root`, the actual config on this machine is:
 
 ```ini
 [Unit]
@@ -207,7 +207,10 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/mnt/c/Project/cc-web
-ExecStart=/usr/bin/node server.js
+Environment=HOME=/root
+Environment=PATH=/root/.nvm/versions/node/v20.19.4/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=CODEX_PATH=/root/.nvm/versions/node/v20.19.4/bin/codex
+ExecStart=/root/.nvm/versions/node/v20.19.4/bin/node /mnt/c/Project/cc-web/server.js
 Restart=on-failure
 RestartSec=5
 KillMode=process
