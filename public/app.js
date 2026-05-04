@@ -40,6 +40,14 @@
     { value: 'haiku', label: 'Haiku', desc: '最快速，适合简单任务' },
   ];
 
+  const CODEX_REASONING_LEVELS = ['medium', 'high', 'xhigh'];
+  const CODEX_REASONING_OPTIONS = [
+    { value: '', label: '默认', desc: '不指定思考强度' },
+    { value: 'medium', label: 'medium', desc: '中等思考强度' },
+    { value: 'high', label: 'high', desc: '更高思考强度' },
+    { value: 'xhigh', label: 'xhigh', desc: '最高思考强度' },
+  ];
+
   const MODE_PICKER_OPTIONS = [
     { value: 'yolo', label: 'YOLO', desc: '跳过所有权限检查' },
     { value: 'plan', label: 'Plan', desc: '执行前需确认计划' },
@@ -1303,12 +1311,35 @@
     costDisplay.textContent = '';
   }
 
+	  function _isCodexReasoningLevel(level) {
+	    return CODEX_REASONING_LEVELS.includes(String(level || '').trim().toLowerCase());
+	  }
+
 	  function _splitCodexThinkingModel(model) {
 	    const raw = String(model || '').trim();
 	    if (!raw) return { base: '', level: '' };
 	    const m = raw.match(/^(.*)\(([^()]+)\)\s*$/);
 	    if (!m) return { base: raw, level: '' };
-	    return { base: (m[1] || '').trim(), level: (m[2] || '').trim().toLowerCase() };
+	    const level = (m[2] || '').trim().toLowerCase();
+	    if (!_isCodexReasoningLevel(level)) return { base: raw, level: '' };
+	    return { base: (m[1] || '').trim(), level };
+	  }
+
+	  function _joinCodexThinkingModel(base, level) {
+	    const model = String(base || '').trim();
+	    const reasoningLevel = String(level || '').trim().toLowerCase();
+	    if (!model) return '';
+	    return _isCodexReasoningLevel(reasoningLevel) ? `${model}(${reasoningLevel})` : model;
+	  }
+
+	  function _codexModelCandidateValue(value) {
+	    const spec = _splitCodexThinkingModel(value);
+	    return String(spec.base || '').trim();
+	  }
+
+	  function _codexReasoningLabel(level) {
+	    const option = CODEX_REASONING_OPTIONS.find((item) => item.value === String(level || '').trim().toLowerCase());
+	    return option ? option.label : CODEX_REASONING_OPTIONS[0].label;
 	  }
 
 	  function _parseCodexModelListText(text) {
@@ -1316,7 +1347,7 @@
 	    const models = [];
 	    String(text || '')
 	      .split(/\r?\n|,/)
-	      .map((item) => item.trim())
+	      .map((item) => _codexModelCandidateValue(item))
 	      .filter(Boolean)
 	      .forEach((item) => {
 	        if (seen.has(item)) return;
@@ -1336,7 +1367,7 @@
 	    };
 	    const seen = new Set();
 	    function addModel(value) {
-	      const model = String(value || '').trim();
+	      const model = _codexModelCandidateValue(value);
 	      if (!model || seen.has(model)) return;
 	      seen.add(model);
 	      normalized.models.push(model);
@@ -1365,7 +1396,7 @@
 	    }
 
 	    function addBaseOption(value, label, desc) {
-	      const { base } = _splitCodexThinkingModel(value);
+	      const base = _codexModelCandidateValue(value);
 	      addOption(base, label || base, desc);
 	    }
 
@@ -3004,15 +3035,8 @@
 	      }
 	      showOptionPicker('选择 Codex 模型', baseOptions, current.base || '', (baseValue) => {
 	        const base = String(baseValue || '').trim();
-	        const thinkingOptions = [
-	          { value: '', label: '无 (默认)', desc: '不附加 (medium/high/xhigh) 后缀' },
-	          { value: 'medium', label: 'medium', desc: '中等 thinking' },
-	          { value: 'high', label: 'high', desc: '更强 thinking' },
-	          { value: 'xhigh', label: 'xhigh', desc: '最强 thinking' },
-	        ];
-	        showOptionPicker('选择 Thinking 强度', thinkingOptions, current.level || '', (lvl) => {
-	          const level = String(lvl || '').trim().toLowerCase();
-	          const full = level ? `${base}(${level})` : base;
+	        showOptionPicker('选择 Thinking 强度', CODEX_REASONING_OPTIONS, current.level || '', (lvl) => {
+	          const full = _joinCodexThinkingModel(base, lvl);
 	          send({ type: 'message', text: `/model ${full}`, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
 	        });
 	      });
@@ -4043,7 +4067,9 @@
       const currentProfileRaw = codexEditingProfiles.find((profile) => profile.name === codexActiveProfile);
       const currentProfile = currentProfileRaw ? normalizeCodexProfile(currentProfileRaw) : null;
       const summaryBase = currentProfile?.apiBase ? escapeHtml(currentProfile.apiBase) : '默认';
-      const summaryModel = currentProfile?.model ? escapeHtml(currentProfile.model) : '未设置';
+      const summaryModelSpec = _splitCodexThinkingModel(currentProfile?.model || '');
+      const summaryModel = summaryModelSpec.base ? escapeHtml(summaryModelSpec.base) : '未设置';
+      const summaryReasoning = _codexReasoningLabel(summaryModelSpec.level);
       const summaryModelsCount = Array.isArray(currentProfile?.models) ? currentProfile.models.length : 0;
 
       codexConfigArea.innerHTML = `
@@ -4060,7 +4086,7 @@
           </div>
         </div>
         <div class="settings-inline-note">
-          当前 Profile：<strong>${escapeHtml(currentProfile?.name || '未选择')}</strong> · API Base：<code>${summaryBase}</code> · 默认模型：<code>${summaryModel}</code> · /model 候选：<code>${summaryModelsCount}</code> 项
+          当前 Profile：<strong>${escapeHtml(currentProfile?.name || '未选择')}</strong> · API Base：<code>${summaryBase}</code> · 默认模型：<code>${summaryModel}</code> · 思考强度：<code>${escapeHtml(summaryReasoning)}</code> · /model 候选：<code>${summaryModelsCount}</code> 项
         </div>
       `;
 
@@ -4092,6 +4118,7 @@
         ? codexEditingProfiles.find((profile) => profile.name === profileName)
         : null;
       const draft = current ? normalizeCodexProfile(current) : { name: '', apiKey: '', apiBase: '', model: '', models: [] };
+      const draftModelSpec = _splitCodexThinkingModel(draft.model || '');
       const initialModelListText = Array.isArray(draft.models) ? draft.models.join('\n') : '';
       const modalOverlay = document.createElement('div');
       modalOverlay.className = 'settings-overlay';
@@ -4133,7 +4160,15 @@
         <div class="settings-divider" style="margin:12px 0"></div>
         <div class="settings-field">
           <label>默认模型</label>
-          <input type="text" id="codex-profile-model" list="codex-profile-dl-models" placeholder="gpt-5.5" value="${escapeHtml(draft.model || '')}" autocomplete="off">
+          <input type="text" id="codex-profile-model" list="codex-profile-dl-models" placeholder="gpt-5.5" value="${escapeHtml(draftModelSpec.base || '')}" autocomplete="off">
+        </div>
+        <div class="settings-field">
+          <label>思考强度</label>
+          <select class="settings-select" id="codex-profile-reasoning">
+            ${CODEX_REASONING_OPTIONS.map((option) =>
+              `<option value="${escapeHtml(option.value)}"${option.value === draftModelSpec.level ? ' selected' : ''}>${escapeHtml(option.label)}</option>`
+            ).join('')}
+          </select>
         </div>
         <datalist id="codex-profile-dl-models"></datalist>
         <div class="settings-field">
@@ -4141,7 +4176,7 @@
           <textarea id="codex-profile-model-list" rows="7" placeholder="每行一个模型，例如&#10;gpt-5.5&#10;gpt-5.4&#10;gpt-5.3-codex" style="resize:vertical">${escapeHtml(initialModelListText)}</textarea>
         </div>
         <div class="settings-inline-note">
-          默认模型会用于新会话；<code>/model</code> 弹出的候选项只来自这里配置的列表。
+          默认模型会用于新会话；思考强度随默认模型保存；<code>/model</code> 弹出的候选项只来自这里配置的列表。
         </div>
         <div class="settings-actions">
           <button class="btn-save" id="codex-profile-ok">确定</button>
@@ -4155,6 +4190,7 @@
       const fetchStatus = modal.querySelector('#codex-profile-fetch-status');
       const datalist = modal.querySelector('#codex-profile-dl-models');
       const defaultModelInput = modal.querySelector('#codex-profile-model');
+      const reasoningSelect = modal.querySelector('#codex-profile-reasoning');
       const modelListTextarea = modal.querySelector('#codex-profile-model-list');
       customEndpointCb.addEventListener('change', () => {
         endpointInput.style.display = customEndpointCb.checked ? '' : 'none';
@@ -4211,14 +4247,15 @@
         const name = modal.querySelector('#codex-profile-name').value.trim();
         const apiKey = modal.querySelector('#codex-profile-apikey').value.trim();
         const apiBase = modal.querySelector('#codex-profile-apibase').value.trim();
-        const model = defaultModelInput.value.trim();
+        const modelBase = defaultModelInput.value.trim();
+        const model = _joinCodexThinkingModel(modelBase, reasoningSelect.value);
         const models = _parseCodexModelListText(modelListTextarea.value);
         if (!name) { alert('请填写 Profile 名称'); return; }
         if (!apiKey) { alert('请填写 API Key'); return; }
         if (!apiBase) { alert('请填写 API Base URL'); return; }
-        if (!model) { alert('请填写模型'); return; }
+        if (!modelBase) { alert('请填写模型'); return; }
         if (!models.length) { alert('请至少填写一个 /model 候选模型'); return; }
-        if (!models.includes(model)) models.unshift(model);
+        if (!models.includes(modelBase)) models.unshift(modelBase);
         const existing = codexEditingProfiles.find((profile) => profile.name === name);
         if (existing && existing !== current) { alert('Profile 名称已存在'); return; }
         if (current) {

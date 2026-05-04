@@ -599,7 +599,8 @@ function normalizeCodexModelList(models, defaultModel = '') {
   const list = [];
 
   function addModel(value) {
-    const model = String(value || '').trim();
+    const spec = splitCodexModelSpec(value);
+    const model = String(spec.base || spec.raw || '').trim();
     if (!model || seen.has(model)) return;
     seen.add(model);
     list.push(model);
