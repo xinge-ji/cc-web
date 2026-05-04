@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
+const readline = require('readline');
 const { WebSocketServer } = require('ws');
 const { createAgentRuntime } = require('./lib/agent-runtime');
 const { createCodexRolloutStore } = require('./lib/codex-rollouts');
@@ -1416,6 +1417,535 @@ class FileTailer {
   }
 }
 
+function codexAppApprovalPolicy(mode) {
+  return mode === 'plan' ? 'on-request' : 'never';
+}
+
+function codexAppSandboxMode(mode) {
+  if (mode === 'yolo') return 'danger-full-access';
+  if (mode === 'plan') return 'read-only';
+  return 'workspace-write';
+}
+
+function codexAppSandboxPolicy(mode, cwd) {
+  if (mode === 'yolo') return { type: 'dangerFullAccess' };
+  if (mode === 'plan') return { type: 'readOnly', networkAccess: false };
+  return {
+    type: 'workspaceWrite',
+    writableRoots: [cwd || process.cwd()],
+    networkAccess: false,
+    excludeTmpdirEnvVar: false,
+    excludeSlashTmp: false,
+  };
+}
+
+function codexAppUserInput(text, attachments = []) {
+  const input = [];
+  if (text) input.push({ type: 'text', text });
+  for (const attachment of attachments) {
+    if (attachment?.path) input.push({ type: 'localImage', path: attachment.path });
+  }
+  return input;
+}
+
+function normalizeCodexAppStatus(status) {
+  const raw = String(status || '').trim();
+  if (raw === 'inProgress') return 'in_progress';
+  return raw || null;
+}
+
+function normalizeCodexAppItem(item) {
+  if (!item || typeof item !== 'object') return item;
+  switch (item.type) {
+    case 'agentMessage':
+      return { id: item.id, type: 'agent_message', text: item.text || '' };
+    case 'commandExecution':
+      return {
+        id: item.id,
+        type: 'command_execution',
+        command: item.command || '',
+        aggregated_output: item.aggregatedOutput || '',
+        exit_code: typeof item.exitCode === 'number' ? item.exitCode : null,
+        status: normalizeCodexAppStatus(item.status),
+      };
+    case 'fileChange':
+      return {
+        id: item.id,
+        type: 'file_change',
+        changes: item.changes || [],
+        status: normalizeCodexAppStatus(item.status),
+      };
+    case 'reasoning':
+      return {
+        id: item.id,
+        type: 'reasoning',
+        text: [...(item.summary || []), ...(item.content || [])].filter(Boolean).join('\n'),
+        status: normalizeCodexAppStatus(item.status),
+      };
+    case 'mcpToolCall':
+      return {
+        id: item.id,
+        type: 'mcp_tool_call',
+        tool_name: item.tool || '',
+        server_name: item.server || '',
+        arguments: item.arguments || null,
+        result: item.result || null,
+        status: normalizeCodexAppStatus(item.status),
+      };
+    case 'dynamicToolCall':
+      return {
+        id: item.id,
+        type: 'mcp_tool_call',
+        tool_name: item.tool || '',
+        arguments: item.arguments || null,
+        result: item.contentItems || null,
+        status: normalizeCodexAppStatus(item.status),
+      };
+    default:
+      return item;
+  }
+}
+
+function makeCodexUsagePayload(tokenUsage) {
+  const usage = tokenUsage?.last || tokenUsage?.total || null;
+  if (!usage) return null;
+  return {
+    input_tokens: usage.inputTokens || 0,
+    cached_input_tokens: usage.cachedInputTokens || 0,
+    output_tokens: usage.outputTokens || 0,
+  };
+}
+
+function codexRpcCall(entry, method, params = {}) {
+  const app = entry.codexAppServer;
+  if (!app?.stdin?.writable) return Promise.reject(new Error('Codex app-server stdin 不可写'));
+  return new Promise((resolve, reject) => {
+    const id = app.nextRpcId++;
+    const timer = setTimeout(() => {
+      if (!app.pendingRpc.has(id)) return;
+      app.pendingRpc.delete(id);
+      reject(new Error(`Codex app-server RPC 超时: ${method}`));
+    }, 30000);
+    app.pendingRpc.set(id, {
+      resolve: (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      reject: (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    });
+    app.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
+  });
+}
+
+function codexSendNotification(entry, method, params = {}) {
+  const app = entry.codexAppServer;
+  if (app?.stdin?.writable) {
+    app.stdin.write(`${JSON.stringify({ method, params })}\n`);
+  }
+}
+
+function codexSendRpcResponse(entry, id, result) {
+  const app = entry.codexAppServer;
+  if (app?.stdin?.writable) {
+    app.stdin.write(`${JSON.stringify({ id, result })}\n`);
+  }
+}
+
+function codexSendRpcError(entry, id, code, message) {
+  const app = entry.codexAppServer;
+  if (app?.stdin?.writable) {
+    app.stdin.write(`${JSON.stringify({ id, error: { code, message } })}\n`);
+  }
+}
+
+function appendCodexAskTool(entry, requestId, params) {
+  const toolUseId = params?.itemId || `request_user_input_${requestId}`;
+  const input = { questions: Array.isArray(params?.questions) ? params.questions : [] };
+  let tool = entry.toolCalls.find((item) => item.id === toolUseId);
+  if (!tool) {
+    tool = {
+      name: 'AskUserQuestion',
+      id: toolUseId,
+      input,
+      kind: 'request_user_input',
+      meta: { kind: 'request_user_input', title: 'User Input', subtitle: '等待用户回复', status: 'in_progress' },
+      done: false,
+    };
+    entry.toolCalls.push(tool);
+    wsSend(entry.ws, {
+      type: 'tool_start',
+      name: tool.name,
+      toolUseId: tool.id,
+      input: tool.input,
+      kind: tool.kind,
+      meta: tool.meta,
+    });
+  }
+  entry.pendingUserInput = {
+    requestId,
+    toolUseId,
+    questions: input.questions,
+    answered: false,
+  };
+  return tool;
+}
+
+function normalizeCodexUserInputAnswers(rawAnswers, questions) {
+  const source = rawAnswers && typeof rawAnswers === 'object' ? rawAnswers : {};
+  const answers = {};
+
+  for (let index = 0; index < questions.length; index++) {
+    const question = questions[index] || {};
+    const questionId = String(question.id || `question_${index + 1}`);
+    const raw = source[questionId];
+    const value = Array.isArray(raw?.answers)
+      ? raw.answers
+      : Array.isArray(raw)
+        ? raw
+        : raw?.answer !== undefined
+          ? [raw.answer]
+          : raw !== undefined
+            ? [raw]
+            : [];
+    const normalized = value
+      .map((item) => String(item ?? '').trim())
+      .filter(Boolean);
+    if (normalized.length === 0) {
+      return { error: `请先回答「${question.header || question.question || questionId}」。` };
+    }
+    answers[questionId] = { answers: normalized };
+  }
+
+  return { answers };
+}
+
+function handleCodexUserInputAnswer(ws, msg) {
+  const sessionId = msg.sessionId || wsSessionMap.get(ws);
+  if (!sessionId) return wsSend(ws, { type: 'error', message: '无法定位当前会话，无法提交 Codex 回复。' });
+
+  const entry = activeProcesses.get(sessionId);
+  if (!entry?.codexAppServer) {
+    return wsSend(ws, { type: 'error', message: '当前会话没有等待中的 Codex 提问。' });
+  }
+
+  const pending = entry.pendingUserInput;
+  if (!pending || pending.answered) {
+    return wsSend(ws, { type: 'error', message: '当前 Codex 提问已处理或不存在。' });
+  }
+  if (msg.toolUseId && msg.toolUseId !== pending.toolUseId) {
+    return wsSend(ws, { type: 'error', message: 'Codex 提问已更新，请重新选择后提交。' });
+  }
+
+  const normalized = normalizeCodexUserInputAnswers(msg.answers, pending.questions || []);
+  if (normalized.error) return wsSend(ws, { type: 'error', message: normalized.error });
+
+  pending.answered = true;
+  codexSendRpcResponse(entry, pending.requestId, normalized);
+
+  const tool = entry.toolCalls.find((item) => item.id === pending.toolUseId);
+  if (tool) {
+    tool.done = true;
+    tool.result = normalized;
+    tool.meta = {
+      ...(tool.meta || {}),
+      kind: 'request_user_input',
+      subtitle: '已回复',
+      status: 'completed',
+    };
+  }
+  entry.pendingUserInput = null;
+  entry.ws = ws;
+  wsSessionMap.set(ws, sessionId);
+
+  wsSend(ws, {
+    type: 'tool_end',
+    toolUseId: pending.toolUseId,
+    result: normalized,
+    kind: 'request_user_input',
+    meta: tool?.meta || { kind: 'request_user_input', subtitle: '已回复', status: 'completed' },
+  });
+  plog('INFO', 'codex_user_input_answered', {
+    sessionId: sessionId.slice(0, 8),
+    toolUseId: pending.toolUseId,
+    questions: Object.keys(normalized.answers || {}).length,
+  });
+}
+
+function handleCodexAppServerRequest(entry, method, requestId, params, sessionId) {
+  switch (method) {
+    case 'item/tool/requestUserInput':
+      appendCodexAskTool(entry, requestId, params || {});
+      plog('INFO', 'codex_user_input_wait', {
+        sessionId: sessionId.slice(0, 8),
+        requestId: String(requestId),
+        questions: Array.isArray(params?.questions) ? params.questions.length : 0,
+      });
+      break;
+    case 'item/commandExecution/requestApproval':
+    case 'item/fileChange/requestApproval':
+    case 'item/permissions/requestApproval':
+    case 'applyPatchApproval':
+    case 'execCommandApproval':
+      // cc-web 目前没有审批 UI；保持既有 Codex exec 的自动化体验，只对用户输入请求显式等待。
+      codexSendRpcResponse(entry, requestId, { decision: 'acceptForSession' });
+      break;
+    default:
+      codexSendRpcError(entry, requestId, -32601, `Unsupported Codex app-server request: ${method}`);
+      break;
+  }
+}
+
+function handleCodexAppServerNotification(entry, method, params, sessionId) {
+  switch (method) {
+    case 'thread/started':
+      if (params?.thread?.id) {
+        const session = loadSession(sessionId);
+        if (session) {
+          setRuntimeSessionId(session, params.thread.id);
+          saveSession(session);
+        }
+      }
+      break;
+    case 'turn/started':
+      entry.codexAppServer.turnId = params?.turn?.id || entry.codexAppServer.turnId || null;
+      break;
+    case 'item/agentMessage/delta':
+      if (params?.delta) {
+        entry.codexAppServer.agentDeltaItems.add(params.itemId);
+        appendFullText(entry, params.delta);
+        wsSend(entry.ws, { type: 'text_delta', text: params.delta }, true);
+      }
+      break;
+    case 'item/started': {
+      const item = normalizeCodexAppItem(params?.item);
+      if (!item || item.type === 'agent_message') break;
+      processRuntimeEvent(entry, { type: 'item.started', item }, sessionId);
+      break;
+    }
+    case 'item/completed': {
+      const item = normalizeCodexAppItem(params?.item);
+      if (!item) break;
+      if (item.type === 'agent_message' && entry.codexAppServer.agentDeltaItems.has(item.id)) break;
+      processRuntimeEvent(entry, { type: 'item.completed', item }, sessionId);
+      break;
+    }
+    case 'thread/tokenUsage/updated':
+      entry.lastUsage = makeCodexUsagePayload(params?.tokenUsage) || entry.lastUsage;
+      break;
+    case 'thread/compacted':
+      if (entry.codexAppServer.completed) break;
+      entry.codexAppServer.completed = true;
+      setTimeout(() => {
+        try { entry.codexAppServer.child.kill('SIGTERM'); } catch {}
+        handleProcessComplete(sessionId, 0, null);
+      }, 50);
+      break;
+    case 'error':
+      entry.lastError = params?.error?.message || params?.message || 'Codex app-server 错误';
+      break;
+    case 'turn/completed':
+      if (entry.codexAppServer.completed) break;
+      entry.codexAppServer.completed = true;
+      if (entry.lastUsage) {
+        processRuntimeEvent(entry, { type: 'turn.completed', usage: entry.lastUsage }, sessionId);
+      }
+      setTimeout(() => {
+        try { entry.codexAppServer.child.kill('SIGTERM'); } catch {}
+        handleProcessComplete(sessionId, 0, null);
+      }, 50);
+      break;
+    default:
+      break;
+  }
+}
+
+function handleCodexAppServerLine(entry, sessionId, line) {
+  const trimmed = String(line || '').trim();
+  if (!trimmed) return;
+  let msg;
+  try {
+    msg = JSON.parse(trimmed);
+  } catch {
+    return;
+  }
+
+  const app = entry.codexAppServer;
+  if (msg.id !== undefined && !msg.method && app.pendingRpc.has(msg.id)) {
+    const pending = app.pendingRpc.get(msg.id);
+    app.pendingRpc.delete(msg.id);
+    if (msg.error) {
+      pending.reject(new Error(msg.error.message || 'Codex app-server RPC 错误'));
+    } else {
+      pending.resolve(msg.result || {});
+    }
+    return;
+  }
+
+  if (msg.id !== undefined && !msg.method) return;
+  if (!msg.method) return;
+  if (msg.id !== undefined) {
+    handleCodexAppServerRequest(entry, msg.method, msg.id, msg.params || {}, sessionId);
+  } else {
+    handleCodexAppServerNotification(entry, msg.method, msg.params || {}, sessionId);
+  }
+}
+
+async function startCodexAppServerTurn(ws, session, spawnSpec, textValue, attachments, outputPath, errorPath) {
+  const currentSessionId = session.id;
+  const modelSpec = splitCodexModelSpec(spawnSpec.model || session.model || '');
+  const mode = spawnSpec.mode || session.permissionMode || 'yolo';
+  const cwd = spawnSpec.cwd || session.cwd || process.cwd();
+  const input = codexAppUserInput(textValue, attachments);
+  if (input.length === 0) return;
+
+  const proc = spawn(spawnSpec.command, spawnSpec.args, {
+    env: spawnSpec.env,
+    cwd,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    detached: !IS_WIN,
+    windowsHide: true,
+  });
+  const entry = {
+    pid: proc.pid || null,
+    ws,
+    agent: 'codex',
+    cwd,
+    fullText: '',
+    attachments,
+    toolCalls: [],
+    lastCost: null,
+    lastUsage: null,
+    lastError: null,
+    errorSent: false,
+    codexHomeDir: spawnSpec.codexHomeDir || '',
+    codexRuntimeKey: spawnSpec.codexRuntimeKey || '',
+    tailer: null,
+    spawnFailed: false,
+    codexAppServer: {
+      child: proc,
+      stdin: proc.stdin,
+      nextRpcId: 1,
+      pendingRpc: new Map(),
+      threadId: spawnSpec.runtimeId || null,
+      turnId: null,
+      completed: false,
+      agentDeltaItems: new Set(),
+    },
+    pendingUserInput: null,
+  };
+
+  if (proc.stdout) {
+    const rl = readline.createInterface({ input: proc.stdout });
+    entry.codexAppServer.rl = rl;
+    rl.on('line', (line) => {
+      fs.appendFile(outputPath, `${line}\n`, () => {});
+      handleCodexAppServerLine(entry, currentSessionId, line);
+    });
+  }
+  if (proc.stderr) {
+    proc.stderr.on('data', (chunk) => {
+      fs.appendFile(errorPath, chunk, () => {});
+      const text = chunk.toString();
+      if (/\b(error|fatal)\b/i.test(text)) entry.lastError = text.trim().slice(-1000);
+    });
+  }
+
+  proc.once('spawn', async () => {
+    try {
+      fs.writeFileSync(path.join(runDir(currentSessionId), 'pid'), String(proc.pid));
+    } catch {}
+    proc.unref();
+    activeProcesses.set(currentSessionId, entry);
+    sendSessionList(ws);
+    plog('INFO', 'process_spawn', {
+      sessionId: currentSessionId.slice(0, 8),
+      pid: proc.pid,
+      agent: 'codex',
+      transport: 'app-server',
+      mode,
+      model: session.model || 'default',
+      resume: !!spawnSpec.runtimeId,
+      sandbox: codexAppSandboxMode(mode),
+      codexHomeDir: spawnSpec.codexHomeDir || null,
+      codexRuntimeKey: spawnSpec.codexRuntimeKey || null,
+      args: spawnSpec.args.join(' '),
+    });
+
+    try {
+      await codexRpcCall(entry, 'initialize', {
+        capabilities: { experimentalApi: true },
+        clientInfo: { name: 'cc-web', title: 'CC-Web', version: '1.3.1' },
+      });
+      codexSendNotification(entry, 'initialized', {});
+
+      const threadParams = {
+        approvalPolicy: codexAppApprovalPolicy(mode),
+        sandbox: codexAppSandboxMode(mode),
+        cwd,
+        model: modelSpec.base || null,
+        persistExtendedHistory: true,
+      };
+      const threadResult = spawnSpec.runtimeId
+        ? await codexRpcCall(entry, 'thread/resume', { ...threadParams, threadId: spawnSpec.runtimeId })
+        : await codexRpcCall(entry, 'thread/start', threadParams);
+      const threadId = threadResult?.thread?.id || spawnSpec.runtimeId;
+      if (!threadId) throw new Error('Codex app-server 未返回 thread id');
+      entry.codexAppServer.threadId = threadId;
+      const stored = loadSession(currentSessionId);
+      if (stored) {
+        setRuntimeSessionId(stored, threadId);
+        if (entry.codexHomeDir) stored.codexHomeDir = entry.codexHomeDir;
+        if (entry.codexRuntimeKey) stored.codexRuntimeKey = entry.codexRuntimeKey;
+        saveSession(stored);
+      }
+
+      if (String(textValue || '').trim() === '/compact' && attachments.length === 0) {
+        await codexRpcCall(entry, 'thread/compact/start', { threadId });
+        return;
+      }
+
+      const turnResult = await codexRpcCall(entry, 'turn/start', {
+        threadId,
+        input,
+        cwd,
+        approvalPolicy: codexAppApprovalPolicy(mode),
+        sandboxPolicy: codexAppSandboxPolicy(mode, cwd),
+        model: modelSpec.base || null,
+        effort: modelSpec.reasoning || null,
+      });
+      entry.codexAppServer.turnId = turnResult?.turn?.id || entry.codexAppServer.turnId || null;
+    } catch (err) {
+      entry.lastError = err?.message || String(err);
+      entry.errorSent = true;
+      wsSend(ws, { type: 'error', message: formatRuntimeError('codex', entry.lastError) });
+      try { proc.kill('SIGTERM'); } catch {}
+      handleProcessComplete(currentSessionId, 1, null);
+    }
+  });
+
+  proc.once('error', (err) => {
+    entry.lastError = err?.message || String(err);
+    activeProcesses.delete(currentSessionId);
+    cleanRunDir(currentSessionId);
+    sendSessionList(ws);
+    wsSend(ws, { type: 'error', message: formatRuntimeError('codex', entry.lastError) });
+  });
+
+  proc.once('exit', (code, signal) => {
+    if (entry.codexAppServer?.completed) return;
+    plog('INFO', 'process_exit_event', {
+      sessionId: currentSessionId.slice(0, 8),
+      pid: proc.pid,
+      exitCode: code,
+      signal,
+    });
+    setTimeout(() => handleProcessComplete(currentSessionId, code, signal), 300);
+  });
+}
+
 // === Process Lifecycle ===
 
 function firstMeaningfulLine(text) {
@@ -1974,6 +2504,9 @@ wss.on('connection', (ws, req) => {
         } else {
           handleMessage(ws, msg);
         }
+        break;
+      case 'codex_user_input_answer':
+        handleCodexUserInputAnswer(ws, msg);
         break;
       case 'abort':
         handleAbort(ws);
@@ -3175,6 +3708,22 @@ function handleMessage(ws, msg, options = {}) {
     fs.writeFileSync(inputPath, textValue);
   }
 
+  if (spawnSpec.parser === 'codex-app-server') {
+    fs.writeFileSync(outputPath, '');
+    fs.writeFileSync(errorPath, '');
+    startCodexAppServerTurn(ws, session, spawnSpec, textValue, resolvedAttachments, outputPath, errorPath)
+      .catch((err) => {
+        plog('ERROR', 'codex_app_server_start_fail', {
+          sessionId: currentSessionId.slice(0, 8),
+          error: err?.message || String(err),
+        });
+        cleanRunDir(currentSessionId);
+        sendSessionList(ws);
+        wsSend(ws, { type: 'error', message: formatRuntimeError('codex', err?.message || String(err)) });
+      });
+    return;
+  }
+
   const outputFd = fs.openSync(outputPath, 'w');
   const errorFd = fs.openSync(errorPath, 'w');
 
@@ -3334,6 +3883,7 @@ function sanitizeToolInput(toolName, input) {
 const {
   buildClaudeSpawnSpec,
   buildCodexSpawnSpec,
+  appendFullText,
   processClaudeEvent,
   processCodexEvent,
   processRuntimeEvent,

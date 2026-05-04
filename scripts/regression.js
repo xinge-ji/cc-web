@@ -328,6 +328,7 @@ async function main() {
     HOME: homeDir,
     CLAUDE_PATH: MOCK_CLAUDE,
     CODEX_PATH: MOCK_CODEX,
+    CC_WEB_CODEX_TRANSPORT: 'exec',
   }, async () => {
     const { ws, messages, token } = await connectWs(port, password);
 
@@ -543,6 +544,64 @@ async function main() {
 
     ws.close();
     console.log('Regression checks passed.');
+  });
+
+  const appConfigDir = path.join(tempRoot, 'app-config');
+  const appSessionsDir = path.join(tempRoot, 'app-sessions');
+  const appLogsDir = path.join(tempRoot, 'app-logs');
+  const appHomeDir = path.join(tempRoot, 'app-home');
+  mkdirp(appConfigDir);
+  mkdirp(appSessionsDir);
+  mkdirp(appLogsDir);
+  mkdirp(appHomeDir);
+  fs.writeFileSync(path.join(appConfigDir, 'notify.json'), JSON.stringify({
+    provider: 'off',
+    pushplus: { token: '' },
+    telegram: { botToken: '', chatId: '' },
+    serverchan: { sendKey: '' },
+    feishu: { webhook: '' },
+    qqbot: { qmsgKey: '' },
+  }, null, 2));
+
+  const appPort = await getFreePort();
+  await withServer({
+    PORT: String(appPort),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: appConfigDir,
+    CC_WEB_SESSIONS_DIR: appSessionsDir,
+    CC_WEB_LOGS_DIR: appLogsDir,
+    HOME: appHomeDir,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+  }, async () => {
+    const { ws, messages } = await connectWs(appPort, password);
+    await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
+
+    const cwd = path.join(tempRoot, 'codex-app-server-space');
+    mkdirp(cwd);
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd, mode: 'yolo' }));
+    const session = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === cwd);
+
+    ws.send(JSON.stringify({ type: 'message', text: 'ask codex question', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+    const askTool = await nextMessage(messages, ws, (msg) => msg.type === 'tool_start' && msg.name === 'AskUserQuestion');
+    assert(askTool.input?.questions?.[0]?.id === 'proceed', 'Codex app-server should surface request_user_input questions');
+
+    await sleep(500);
+    assert(!messages.some((msg) => msg.type === 'done' && msg.sessionId === session.sessionId), 'Codex app-server must wait for user input before completing the turn');
+
+    ws.send(JSON.stringify({
+      type: 'codex_user_input_answer',
+      sessionId: session.sessionId,
+      toolUseId: askTool.toolUseId,
+      answers: { proceed: { answers: ['暂停'] } },
+    }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'tool_end' && msg.toolUseId === askTool.toolUseId);
+    const answerDelta = await nextMessage(messages, ws, (msg) => msg.type === 'text_delta' && /暂停/.test(msg.text || ''));
+    assert(/暂停/.test(answerDelta.text || ''), 'Codex app-server should continue with the submitted answer');
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
+
+    ws.close();
+    console.log('Codex app-server request_user_input checks passed.');
   });
 }
 

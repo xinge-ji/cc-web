@@ -1446,29 +1446,6 @@ body.session-loading-active {
   white-space: pre-wrap;
   word-break: break-word;
 }
-/* 确认按钮 — 仅移动端 */
-.ask-confirm-btn {
-  display: none;
-  grid-row: 2;
-  grid-column: 1 / -1;
-  width: 100%;
-  padding: 9px 0;
-  border: 1.5px solid var(--accent);
-  border-radius: 8px;
-  background: transparent;
-  color: var(--accent);
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background 0.12s, color 0.12s;
-}
-.ask-confirm-btn:active {
-  background: var(--accent);
-  color: #fff;
-}
-@media (pointer: coarse) {
-  .ask-confirm-btn { display: block; }
-}
 .ask-option-item {
   border: 1px solid var(--border-color);
   border-radius: 8px;
@@ -1487,6 +1464,10 @@ body.session-loading-active {
   background: var(--accent-light);
   border-color: var(--accent);
 }
+.ask-option-item:disabled {
+  cursor: default;
+  opacity: 0.8;
+}
 .ask-option-label {
   font-size: 12px;
   font-weight: 600;
@@ -1497,6 +1478,40 @@ body.session-loading-active {
   color: var(--text-secondary);
   line-height: 1.45;
   margin-top: 4px;
+}
+.ask-answer-input {
+  width: 100%;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 9px 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+}
+.ask-answer-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: #fff;
+}
+.ask-submit-btn {
+  width: 100%;
+  padding: 9px 0;
+  border: 1.5px solid var(--accent);
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ask-submit-btn:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+.ask-submit-status {
+  font-size: 12px;
+  color: var(--text-secondary);
 }
 
 /* Typing indicator */
