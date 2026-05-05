@@ -558,6 +558,7 @@ let MODEL_MAP = {
 };
 
 const VALID_AGENTS = new Set(['claude', 'codex']);
+const CODEX_THREAD_TRANSPORTS = new Set(['exec', 'app-server']);
 
 // Final fallback only. New Codex sessions prefer:
 // 1) active custom profile model
@@ -947,14 +948,21 @@ function prepareCodexCustomRuntime(config, session = null) {
   const configToml = [
     'preferred_auth_method = "apikey"',
     'model_provider = "openai_compat"',
+    'disable_response_storage = true',
     ...(modelSpec.base ? [`model = ${tomlString(modelSpec.base)}`] : []),
     ...(modelSpec.reasoning ? [`model_reasoning_effort = ${tomlString(modelSpec.reasoning)}`] : []),
+    '',
+    '[features]',
+    'default_mode_request_user_input = true',
+    'responses_websockets = false',
+    'responses_websockets_v2 = false',
     '',
     '[model_providers.openai_compat]',
     `name = ${tomlString(activeProfile.name || 'OpenAI Compat')}`,
     `base_url = ${tomlString(runtimeApiBase)}`,
     'env_key = "OPENAI_API_KEY"',
     'wire_api = "responses"',
+    'requires_openai_auth = true',
     '',
   ].join('\n');
   fs.writeFileSync(path.join(homeDir, 'config.toml'), configToml);
@@ -1223,6 +1231,8 @@ function normalizeSession(session) {
   session.agent = normalizeAgent(session.agent);
   if (!Object.prototype.hasOwnProperty.call(session, 'claudeSessionId')) session.claudeSessionId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'codexThreadId')) session.codexThreadId = null;
+  if (!Object.prototype.hasOwnProperty.call(session, 'codexThreadTransport')) session.codexThreadTransport = '';
+  session.codexThreadTransport = CODEX_THREAD_TRANSPORTS.has(session.codexThreadTransport) ? session.codexThreadTransport : '';
   if (!Object.prototype.hasOwnProperty.call(session, 'codexHomeDir')) session.codexHomeDir = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'codexRuntimeKey')) session.codexRuntimeKey = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'totalCost')) session.totalCost = 0;
@@ -1253,6 +1263,41 @@ function isClaudeSession(session) {
   return getSessionAgent(session) === 'claude';
 }
 
+function inferCodexThreadTransportFromLogs(session) {
+  if (!session?.id || !session.codexThreadId || getSessionAgent(session) !== 'codex') return '';
+  const sessionPrefix = session.id.slice(0, 8);
+  const files = [LOG_FILE.replace(/\.log$/, '.old.log'), LOG_FILE];
+  let inferred = '';
+  for (const filePath of files) {
+    let lines = [];
+    try {
+      lines = fs.readFileSync(filePath, 'utf8').split('\n');
+    } catch {
+      continue;
+    }
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let entry;
+      try { entry = JSON.parse(line); } catch { continue; }
+      if (entry.event !== 'process_spawn' || entry.agent !== 'codex' || entry.sessionId !== sessionPrefix) continue;
+      if (entry.resume !== false) continue;
+      if (entry.transport === 'app-server') {
+        inferred = 'app-server';
+      } else if (String(entry.args || '').startsWith('exec')) {
+        inferred = 'exec';
+      }
+    }
+  }
+  return inferred;
+}
+
+function applyCodexThreadTransportInference(session) {
+  if (!session || getSessionAgent(session) !== 'codex' || !session.codexThreadId || session.codexThreadTransport) return session;
+  const inferred = inferCodexThreadTransportFromLogs(session);
+  if (inferred) session.codexThreadTransport = inferred;
+  return session;
+}
+
 function getRuntimeSessionId(session) {
   if (!session) return null;
   return getSessionAgent(session) === 'codex'
@@ -1260,10 +1305,13 @@ function getRuntimeSessionId(session) {
     : (session.claudeSessionId || null);
 }
 
-function setRuntimeSessionId(session, runtimeId) {
+function setRuntimeSessionId(session, runtimeId, meta = {}) {
   if (!session) return;
   if (getSessionAgent(session) === 'codex') {
     session.codexThreadId = runtimeId || null;
+    const transport = CODEX_THREAD_TRANSPORTS.has(meta.codexThreadTransport) ? meta.codexThreadTransport : '';
+    if (runtimeId && transport) session.codexThreadTransport = transport;
+    if (!runtimeId) session.codexThreadTransport = '';
   } else {
     session.claudeSessionId = runtimeId || null;
   }
@@ -1275,7 +1323,7 @@ function clearRuntimeSessionId(session) {
 
 function loadSession(id) {
   try {
-    return normalizeSession(JSON.parse(fs.readFileSync(sessionPath(id), 'utf8')));
+    return applyCodexThreadTransportInference(normalizeSession(JSON.parse(fs.readFileSync(sessionPath(id), 'utf8'))));
   } catch {
     return null;
   }
@@ -1517,6 +1565,38 @@ function makeCodexUsagePayload(tokenUsage) {
   };
 }
 
+function rejectCodexAppPendingRpc(app, err) {
+  if (!app?.pendingRpc) return;
+  const error = err instanceof Error ? err : new Error(String(err || 'Codex app-server 写入失败'));
+  for (const pending of app.pendingRpc.values()) {
+    pending.reject(error);
+  }
+  app.pendingRpc.clear();
+}
+
+function codexAppWrite(entry, payload, onError = null) {
+  const app = entry?.codexAppServer;
+  if (!app?.stdin?.writable || app.stdin.destroyed) {
+    const err = new Error('Codex app-server stdin 不可写');
+    if (onError) onError(err);
+    return false;
+  }
+  try {
+    app.stdin.write(`${payload}\n`, (err) => {
+      if (!err) return;
+      const writeErr = err instanceof Error ? err : new Error(String(err));
+      entry.lastError = writeErr.message;
+      if (onError) onError(writeErr);
+    });
+    return true;
+  } catch (err) {
+    const writeErr = err instanceof Error ? err : new Error(String(err));
+    entry.lastError = writeErr.message;
+    if (onError) onError(writeErr);
+    return false;
+  }
+}
+
 function codexRpcCall(entry, method, params = {}) {
   const app = entry.codexAppServer;
   if (!app?.stdin?.writable) return Promise.reject(new Error('Codex app-server stdin 不可写'));
@@ -1537,32 +1617,29 @@ function codexRpcCall(entry, method, params = {}) {
         reject(err);
       },
     });
-    app.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
+    const fail = (err) => {
+      if (!app.pendingRpc.has(id)) return;
+      app.pendingRpc.delete(id);
+      clearTimeout(timer);
+      reject(err);
+    };
+    codexAppWrite(entry, JSON.stringify({ id, method, params }), fail);
   });
 }
 
 function codexSendNotification(entry, method, params = {}) {
-  const app = entry.codexAppServer;
-  if (app?.stdin?.writable) {
-    app.stdin.write(`${JSON.stringify({ method, params })}\n`);
-  }
+  codexAppWrite(entry, JSON.stringify({ method, params }));
 }
 
 function codexSendRpcResponse(entry, id, result) {
-  const app = entry.codexAppServer;
-  if (app?.stdin?.writable) {
-    app.stdin.write(`${JSON.stringify({ id, result })}\n`);
-  }
+  codexAppWrite(entry, JSON.stringify({ id, result }));
 }
 
 function codexSendRpcError(entry, id, code, message) {
-  const app = entry.codexAppServer;
-  if (app?.stdin?.writable) {
-    app.stdin.write(`${JSON.stringify({ id, error: { code, message } })}\n`);
-  }
+  codexAppWrite(entry, JSON.stringify({ id, error: { code, message } }));
 }
 
-function appendCodexAskTool(entry, requestId, params) {
+function appendCodexAskTool(entry, requestId, params, sessionId) {
   const toolUseId = params?.itemId || `request_user_input_${requestId}`;
   const input = { questions: Array.isArray(params?.questions) ? params.questions : [] };
   let tool = entry.toolCalls.find((item) => item.id === toolUseId);
@@ -1578,6 +1655,7 @@ function appendCodexAskTool(entry, requestId, params) {
     entry.toolCalls.push(tool);
     wsSend(entry.ws, {
       type: 'tool_start',
+      sessionId,
       name: tool.name,
       toolUseId: tool.id,
       input: tool.input,
@@ -1663,6 +1741,7 @@ function handleCodexUserInputAnswer(ws, msg) {
 
   wsSend(ws, {
     type: 'tool_end',
+    sessionId,
     toolUseId: pending.toolUseId,
     result: normalized,
     kind: 'request_user_input',
@@ -1678,7 +1757,7 @@ function handleCodexUserInputAnswer(ws, msg) {
 function handleCodexAppServerRequest(entry, method, requestId, params, sessionId) {
   switch (method) {
     case 'item/tool/requestUserInput':
-      appendCodexAskTool(entry, requestId, params || {});
+      appendCodexAskTool(entry, requestId, params || {}, sessionId);
       plog('INFO', 'codex_user_input_wait', {
         sessionId: sessionId.slice(0, 8),
         requestId: String(requestId),
@@ -1705,7 +1784,7 @@ function handleCodexAppServerNotification(entry, method, params, sessionId) {
       if (params?.thread?.id) {
         const session = loadSession(sessionId);
         if (session) {
-          setRuntimeSessionId(session, params.thread.id);
+          setRuntimeSessionId(session, params.thread.id, { codexThreadTransport: 'app-server' });
           saveSession(session);
         }
       }
@@ -1717,7 +1796,7 @@ function handleCodexAppServerNotification(entry, method, params, sessionId) {
       if (params?.delta) {
         entry.codexAppServer.agentDeltaItems.add(params.itemId);
         appendFullText(entry, params.delta);
-        wsSend(entry.ws, { type: 'text_delta', text: params.delta }, true);
+        wsSend(entry.ws, { type: 'text_delta', sessionId, text: params.delta }, true);
       }
       break;
     case 'item/started': {
@@ -1837,6 +1916,13 @@ async function startCodexAppServerTurn(ws, session, spawnSpec, textValue, attach
     },
     pendingUserInput: null,
   };
+  if (proc.stdin) {
+    proc.stdin.on('error', (err) => {
+      const message = err?.message || String(err);
+      entry.lastError = message;
+      rejectCodexAppPendingRpc(entry.codexAppServer, new Error(`Codex app-server stdin 写入失败: ${message}`));
+    });
+  }
 
   if (proc.stdout) {
     const rl = readline.createInterface({ input: proc.stdout });
@@ -1897,7 +1983,7 @@ async function startCodexAppServerTurn(ws, session, spawnSpec, textValue, attach
       entry.codexAppServer.threadId = threadId;
       const stored = loadSession(currentSessionId);
       if (stored) {
-        setRuntimeSessionId(stored, threadId);
+        setRuntimeSessionId(stored, threadId, { codexThreadTransport: 'app-server' });
         if (entry.codexHomeDir) stored.codexHomeDir = entry.codexHomeDir;
         if (entry.codexRuntimeKey) stored.codexRuntimeKey = entry.codexRuntimeKey;
         saveSession(stored);
@@ -1921,7 +2007,7 @@ async function startCodexAppServerTurn(ws, session, spawnSpec, textValue, attach
     } catch (err) {
       entry.lastError = err?.message || String(err);
       entry.errorSent = true;
-      wsSend(ws, { type: 'error', message: formatRuntimeError('codex', entry.lastError) });
+      wsSend(ws, { type: 'error', sessionId: currentSessionId, message: formatRuntimeError('codex', entry.lastError) });
       try { proc.kill('SIGTERM'); } catch {}
       handleProcessComplete(currentSessionId, 1, null);
     }
@@ -1932,7 +2018,7 @@ async function startCodexAppServerTurn(ws, session, spawnSpec, textValue, attach
     activeProcesses.delete(currentSessionId);
     cleanRunDir(currentSessionId);
     sendSessionList(ws);
-    wsSend(ws, { type: 'error', message: formatRuntimeError('codex', entry.lastError) });
+    wsSend(ws, { type: 'error', sessionId: currentSessionId, message: formatRuntimeError('codex', entry.lastError) });
   });
 
   proc.once('exit', (code, signal) => {
@@ -1975,8 +2061,14 @@ function formatRuntimeError(agent, raw, context = {}) {
   }
 
   if (agent === 'codex') {
-    if (/stream disconnected before completion|stream closed before response\.completed|response\.completed/i.test(condensed)) {
-      return 'Codex 上游响应流提前中断：当前自定义 API 的 Responses 流式协议没有完整发送 response.completed。请检查该 API 端点是否完整兼容 OpenAI Responses SSE，或切回确认兼容的 API 模板。';
+    if (/stream disconnected before completion.*error sending request for url|error sending request for url/i.test(condensed)) {
+      return 'Codex 上游请求连接提前中断：当前自定义 API 的 /v1/responses 请求没有稳定完成。请检查 API Base、代理网络、上游服务可用性和超时设置；这类错误通常发生在连接被关闭或上游不可达时。';
+    }
+    if (/stream closed before response\.completed|response\.completed/i.test(condensed)) {
+      return 'Codex 上游响应流提前中断：当前自定义 API 的 Responses SSE 没有完整发送 response.completed。Codex CLI 当前只支持 Responses wire API；请检查该端点是否输出完整 Responses 事件流，而不是仅输出 Chat Completions 风格的 [DONE]。';
+    }
+    if (/stream disconnected before completion/i.test(condensed)) {
+      return 'Codex 上游响应流提前中断：当前自定义 API 的 Responses 流没有正常完成。请检查上游连接稳定性，以及 SSE 是否完整输出到结束事件。';
     }
     if (/ENOENT|not found|No such file/i.test(condensed)) {
       return '找不到 Codex CLI。请检查 Codex 设置里的 CLI 路径，或确认系统 PATH 中可直接运行 `codex`。';
@@ -2165,26 +2257,26 @@ function handleProcessComplete(sessionId, exitCode, signal) {
       if (autoRetryRequested) {
         if (contextLimitExceeded) {
           pendingCompactRetries.delete(sessionId);
-          wsSend(entry.ws, { type: 'system_message', message: '已尝试执行 /compact，但仍未成功解除上下文超限。请手动缩小输入范围后重试。' });
+          wsSend(entry.ws, { type: 'system_message', sessionId, message: '已尝试执行 /compact，但仍未成功解除上下文超限。请手动缩小输入范围后重试。' });
         } else {
-          wsSend(entry.ws, { type: 'system_message', message: compactDoneMessage(entry.agent || 'claude') });
-          wsSend(entry.ws, { type: 'system_message', message: compactAutoResumeMessage(entry.agent || 'claude') });
+          wsSend(entry.ws, { type: 'system_message', sessionId, message: compactDoneMessage(entry.agent || 'claude') });
+          wsSend(entry.ws, { type: 'system_message', sessionId, message: compactAutoResumeMessage(entry.agent || 'claude') });
           shouldReturnForFollowup = true;
         }
       } else {
-        wsSend(entry.ws, { type: 'system_message', message: compactDoneMessage(entry.agent || 'claude') });
+        wsSend(entry.ws, { type: 'system_message', sessionId, message: compactDoneMessage(entry.agent || 'claude') });
       }
     }
 
     if (contextLimitExceeded && !pendingSlash && session && getRuntimeSessionId(session)) {
       pendingCompactRetries.set(sessionId, { text: pendingRetry?.text || '', mode: pendingRetry?.mode || session.permissionMode || 'yolo', reason: 'auto' });
-      wsSend(entry.ws, { type: 'system_message', message: compactAutoStartMessage(entry.agent || 'claude') });
+      wsSend(entry.ws, { type: 'system_message', sessionId, message: compactAutoStartMessage(entry.agent || 'claude') });
       shouldAutoCompact = true;
     }
 
     if (completionError && !entry.errorSent && !shouldAutoCompact) {
       entry.errorSent = true;
-      wsSend(entry.ws, { type: 'error', message: completionError });
+      wsSend(entry.ws, { type: 'error', sessionId, message: completionError });
     }
 
     wsSend(entry.ws, { type: 'done', sessionId, costUsd: entry.lastCost || null });
@@ -2229,7 +2321,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
       const retry = pendingCompactRetries.get(sessionId);
       if (retry?.text) {
         pendingCompactRetries.delete(sessionId);
-        handleMessage(entry.ws, { text: retry.text, sessionId, mode: retry.mode || session.permissionMode || 'yolo' });
+          handleMessage(entry.ws, { text: retry.text, sessionId, mode: retry.mode || session.permissionMode || 'yolo' });
       }
       return;
     }
@@ -2516,7 +2608,7 @@ wss.on('connection', (ws, req) => {
         handleNewSession(ws, msg);
         break;
       case 'load_session':
-        handleLoadSession(ws, msg.sessionId);
+        handleLoadSession(ws, msg.sessionId, msg.viewRequestId || null);
         break;
       case 'delete_session':
         handleDeleteSession(ws, msg.sessionId);
@@ -2980,6 +3072,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
   const cmd = parts[0].toLowerCase();
   let session = sessionId ? loadSession(sessionId) : null;
   const agent = session ? getSessionAgent(session) : normalizeAgent(fallbackAgent);
+  const sessionEvent = (type, data = {}) => wsSend(ws, { type, sessionId: session?.id || sessionId || null, ...data });
 
   switch (cmd) {
     case '/clear': {
@@ -3011,7 +3104,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
           remoteCwd: session.remoteCwd || '',
         });
       }
-      wsSend(ws, { type: 'system_message', message: '会话已清除，上下文已重置。' });
+      sessionEvent('system_message', { message: '会话已清除，上下文已重置。' });
       break;
     }
 
@@ -3020,23 +3113,23 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
       if (agent === 'codex') {
         if (!modelInput) {
           const current = session?.model || resolveDefaultCodexModel() || '配置默认模型';
-          wsSend(ws, { type: 'system_message', message: `当前 Codex 模型: ${current}\n用法: /model <模型名>` });
+          sessionEvent('system_message', { message: `当前 Codex 模型: ${current}\n用法: /model <模型名>` });
         } else {
           if (session) {
             session.model = modelInput;
             session.updated = new Date().toISOString();
             saveSession(session);
           }
-          wsSend(ws, { type: 'model_changed', model: modelInput });
-          wsSend(ws, { type: 'system_message', message: `Codex 模型已切换为: ${modelInput}` });
+          sessionEvent('model_changed', { model: modelInput });
+          sessionEvent('system_message', { message: `Codex 模型已切换为: ${modelInput}` });
         }
       } else if (!modelInput) {
         const current = session?.model ? modelShortName(session.model) || session.model : 'opus (默认)';
-        wsSend(ws, { type: 'system_message', message: `当前模型: ${current}\n可选: opus, sonnet, haiku` });
+        sessionEvent('system_message', { message: `当前模型: ${current}\n可选: opus, sonnet, haiku` });
       } else {
         const modelKey = modelInput.toLowerCase();
         if (!MODEL_MAP[modelKey]) {
-          wsSend(ws, { type: 'system_message', message: `无效模型: ${modelInput}\n可选: opus, sonnet, haiku` });
+          sessionEvent('system_message', { message: `无效模型: ${modelInput}\n可选: opus, sonnet, haiku` });
         } else {
           const model = MODEL_MAP[modelKey];
           if (session) {
@@ -3044,8 +3137,8 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
             session.updated = new Date().toISOString();
             saveSession(session);
           }
-          wsSend(ws, { type: 'model_changed', model: modelKey });
-          wsSend(ws, { type: 'system_message', message: `模型已切换为: ${modelKey}` });
+          sessionEvent('model_changed', { model: modelKey });
+          sessionEvent('system_message', { message: `模型已切换为: ${modelKey}` });
         }
       }
       break;
@@ -3054,30 +3147,28 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
     case '/cost': {
       if (agent === 'codex') {
         const usage = session?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
-        wsSend(ws, {
-          type: 'system_message',
+        sessionEvent('system_message', {
           message: `当前会话累计 Token: 输入 ${usage.inputTokens}，缓存 ${usage.cachedInputTokens}，输出 ${usage.outputTokens}`,
         });
       } else {
         const cost = session?.totalCost || 0;
-        wsSend(ws, { type: 'system_message', message: `当前会话累计费用: $${cost.toFixed(4)}` });
+        sessionEvent('system_message', { message: `当前会话累计费用: $${cost.toFixed(4)}` });
       }
       break;
     }
 
     case '/compact': {
       if (!sessionId || !session) {
-        wsSend(ws, { type: 'system_message', message: '当前没有可压缩的会话。请先进入一个已进行过对话的会话后再执行 /compact。' });
+        sessionEvent('system_message', { message: '当前没有可压缩的会话。请先进入一个已进行过对话的会话后再执行 /compact。' });
         break;
       }
       if (activeProcesses.has(sessionId)) {
-        wsSend(ws, { type: 'system_message', message: '当前会话正在处理中，请先等待完成或点击停止，再执行 /compact。' });
+        sessionEvent('system_message', { message: '当前会话正在处理中，请先等待完成或点击停止，再执行 /compact。' });
         break;
       }
       const runtimeId = getRuntimeSessionId(session);
       if (!runtimeId) {
-        wsSend(ws, {
-          type: 'system_message',
+        sessionEvent('system_message', {
           message: agent === 'codex'
             ? '当前会话尚未建立 Codex 上下文，暂时无需压缩。'
             : '当前会话尚未建立 Claude 上下文，暂时无需压缩。',
@@ -3085,7 +3176,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
         break;
       }
 
-      wsSend(ws, { type: 'system_message', message: compactStartMessage(agent) });
+      sessionEvent('system_message', { message: compactStartMessage(agent) });
       pendingSlashCommands.set(session.id, { kind: 'compact' });
       handleMessage(ws, { text: '/compact', sessionId: session.id, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
       break;
@@ -3093,14 +3184,14 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
 
     case '/init': {
       if (!sessionId || !session) {
-        wsSend(ws, { type: 'system_message', message: '请先进入一个会话后再执行 /init。' });
+        sessionEvent('system_message', { message: '请先进入一个会话后再执行 /init。' });
         break;
       }
       if (activeProcesses.has(sessionId)) {
-        wsSend(ws, { type: 'system_message', message: '当前会话正在处理中，请先等待完成或点击停止。' });
+        sessionEvent('system_message', { message: '当前会话正在处理中，请先等待完成或点击停止。' });
         break;
       }
-      wsSend(ws, { type: 'system_message', message: initStartMessage(agent) });
+      sessionEvent('system_message', { message: initStartMessage(agent) });
       pendingSlashCommands.set(session.id, { kind: 'init' });
       handleMessage(ws, {
         text: agent === 'codex' ? buildCodexInitPrompt(session.cwd) : '/init',
@@ -3112,11 +3203,11 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
 
     case '/github': {
       if (!sessionId || !session) {
-        wsSend(ws, { type: 'system_message', message: '请先进入一个会话后再执行 /github。' });
+        sessionEvent('system_message', { message: '请先进入一个会话后再执行 /github。' });
         break;
       }
       if (activeProcesses.has(sessionId)) {
-        wsSend(ws, { type: 'system_message', message: '当前会话正在处理中，请先等待完成或点击停止。' });
+        sessionEvent('system_message', { message: '当前会话正在处理中，请先等待完成或点击停止。' });
         break;
       }
       const ghArgs = parts.slice(1).join(' ').trim() || '列出所有可用仓库';
@@ -3142,11 +3233,11 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
 
     case '/ssh': {
       if (!sessionId || !session) {
-        wsSend(ws, { type: 'system_message', message: '请先进入一个会话后再执行 /ssh。' });
+        sessionEvent('system_message', { message: '请先进入一个会话后再执行 /ssh。' });
         break;
       }
       if (activeProcesses.has(sessionId)) {
-        wsSend(ws, { type: 'system_message', message: '当前会话正在处理中，请先等待完成或点击停止。' });
+        sessionEvent('system_message', { message: '当前会话正在处理中，请先等待完成或点击停止。' });
         break;
       }
       const sshArgs = parts.slice(1).join(' ').trim() || '列出所有可用主机';
@@ -3178,7 +3269,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
 		      const MODE_DESC = { default: '默认（需权限审批，受限操作）', plan: 'Plan（需确认计划后执行）', yolo: 'YOLO（跳过所有权限检查）' };
 		      if (!modeInput) {
 		        const cur = session?.permissionMode || 'yolo';
-		        wsSend(ws, { type: 'system_message', message: `当前模式: ${MODE_DESC[cur] || cur}\n可选: default, plan, yolo` });
+		        sessionEvent('system_message', { message: `当前模式: ${MODE_DESC[cur] || cur}\n可选: default, plan, yolo` });
 		      } else if (VALID_MODES.includes(modeInput.toLowerCase())) {
 		        const mode = modeInput.toLowerCase();
 		        if (session) {
@@ -3187,10 +3278,10 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
 		          session.updated = new Date().toISOString();
 		          saveSession(session);
 		        }
-		        wsSend(ws, { type: 'system_message', message: `权限模式已切换为: ${MODE_DESC[mode]}` });
-		        wsSend(ws, { type: 'mode_changed', mode });
+		        sessionEvent('system_message', { message: `权限模式已切换为: ${MODE_DESC[mode]}` });
+		        sessionEvent('mode_changed', { mode });
 		      } else {
-	        wsSend(ws, { type: 'system_message', message: `无效模式: ${modeInput}\n可选: default, plan, yolo` });
+	        sessionEvent('system_message', { message: `无效模式: ${modeInput}\n可选: default, plan, yolo` });
       }
       break;
     }
@@ -3203,8 +3294,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
         '/github [指令] — GitHub 操作（读取开发者配置后执行）\n' +
         '/ssh [指令] — SSH 远程操作（读取开发者配置后执行）\n' +
         '/help — 显示本帮助';
-      wsSend(ws, {
-        type: 'system_message',
+      sessionEvent('system_message', {
         message: agent === 'codex'
           ? base + '\n/model [名称] — 查看/切换 Codex 模型（自由输入）\n/compact — 执行 Codex /compact 压缩上下文\n/init — 分析项目并生成/更新 AGENTS.md'
           : base + '\n/model [名称] — 查看/切换模型（opus, sonnet, haiku）\n/compact — 执行 Claude 原生上下文压缩（保留压缩计划并可自动续跑）\n/init — 分析项目并生成/更新 CLAUDE.md',
@@ -3213,13 +3303,14 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
     }
 
     default:
-      wsSend(ws, { type: 'system_message', message: `未知指令: ${cmd}\n输入 /help 查看可用指令` });
+      sessionEvent('system_message', { message: `未知指令: ${cmd}\n输入 /help 查看可用指令` });
   }
 }
 
 // === Session Handlers ===
 function handleNewSession(ws, msg) {
   const cwd = (msg && msg.cwd) ? String(msg.cwd) : null;
+  const viewRequestId = msg?.viewRequestId || null;
   const agent = normalizeAgent(msg?.agent);
   const requestedMode = ['default', 'plan', 'yolo'].includes(msg?.mode) ? msg.mode : 'yolo';
   const taskMode = msg?.taskMode === 'remote' ? 'remote' : 'local';
@@ -3249,6 +3340,7 @@ function handleNewSession(ws, msg) {
     agent,
     claudeSessionId: null,
     codexThreadId: null,
+    codexThreadTransport: '',
     model: agent === 'codex' ? resolveDefaultCodexModel() : MODEL_MAP.opus,
     permissionMode: requestedMode,
     totalCost: 0,
@@ -3263,6 +3355,7 @@ function handleNewSession(ws, msg) {
   wsSessionMap.set(ws, id);
   wsSend(ws, {
     type: 'session_info',
+    viewRequestId,
     sessionId: id,
     messages: [],
     title: session.title,
@@ -3310,7 +3403,7 @@ function handleNewSession(ws, msg) {
   }
 }
 
-function handleLoadSession(ws, sessionId) {
+function handleLoadSession(ws, sessionId, viewRequestId = null) {
   const session = loadSession(sessionId);
   if (!session) {
     return wsSend(ws, { type: 'error', message: 'Session not found' });
@@ -3342,6 +3435,7 @@ function handleLoadSession(ws, sessionId) {
 
   wsSend(ws, {
     type: 'session_info',
+    viewRequestId,
     sessionId: session.id,
     messages: recentMessages,
     title: session.title,
@@ -3366,6 +3460,7 @@ function handleLoadSession(ws, sessionId) {
     olderChunks.forEach((chunk, index) => {
       wsSend(ws, {
         type: 'session_history_chunk',
+        viewRequestId,
         sessionId: session.id,
         messages: chunk,
         remaining: Math.max(0, olderChunks.length - index - 1),
@@ -3513,7 +3608,7 @@ function handleRenameSession(ws, sessionId, title) {
 		      saveSession(session);
 		    }
 		  }
-		  wsSend(ws, { type: 'mode_changed', mode });
+		  wsSend(ws, { type: 'mode_changed', sessionId: sessionId || null, mode });
 		}
 
 function handleDisconnect(ws, wsId) {
@@ -3562,7 +3657,7 @@ function handleMessage(ws, msg, options = {}) {
   const normalizedText = textValue.trim();
   const resolvedAttachments = resolveMessageAttachments(attachments);
   if (attachments.length > 0 && resolvedAttachments.length === 0) {
-    return wsSend(ws, { type: 'error', message: '图片附件已过期或不可用，请重新上传后再发送。' });
+    return wsSend(ws, { type: 'error', sessionId: sessionId || null, viewRequestId: msg.viewRequestId || null, message: '图片附件已过期或不可用，请重新上传后再发送。' });
   }
   if (!normalizedText && resolvedAttachments.length === 0) return;
 
@@ -3578,7 +3673,7 @@ function handleMessage(ws, msg, options = {}) {
   }));
 
   if (sessionId && activeProcesses.has(sessionId)) {
-    return wsSend(ws, { type: 'error', message: '正在处理中，请先点击停止按钮。' });
+    return wsSend(ws, { type: 'error', sessionId, viewRequestId: msg.viewRequestId || null, message: '正在处理中，请先点击停止按钮。' });
   }
 
   const derivedTitle = normalizedText
@@ -3599,6 +3694,7 @@ function handleMessage(ws, msg, options = {}) {
 	      agent,
 	      claudeSessionId: null,
 	      codexThreadId: null,
+	      codexThreadTransport: '',
 	      model: agent === 'codex' ? resolveDefaultCodexModel() : null,
 	      permissionMode: mode || 'yolo',
 	      totalCost: 0,
@@ -3610,7 +3706,7 @@ function handleMessage(ws, msg, options = {}) {
   normalizeSession(session);
 
   if (normalizedText.startsWith('/') && resolvedAttachments.length > 0) {
-    return wsSend(ws, { type: 'error', message: '命令消息暂不支持同时附带图片。请先发送图片说明，再单独使用 /model 或 /mode。' });
+    return wsSend(ws, { type: 'error', sessionId: session.id, viewRequestId: msg.viewRequestId || null, message: '命令消息暂不支持同时附带图片。请先发送图片说明，再单独使用 /model 或 /mode。' });
   }
 
   if (mode && ['default', 'plan', 'yolo'].includes(mode)) {
@@ -3646,6 +3742,7 @@ function handleMessage(ws, msg, options = {}) {
   if (!sessionId) {
     wsSend(ws, {
       type: 'session_info',
+      viewRequestId: msg.viewRequestId || null,
       sessionId: currentSessionId,
       messages: session.messages,
       title: session.title,
@@ -3670,7 +3767,7 @@ function handleMessage(ws, msg, options = {}) {
     ? buildClaudeSpawnSpec(session, { attachments: resolvedAttachments })
     : buildCodexSpawnSpec(session, { attachments: resolvedAttachments });
   if (spawnSpec?.error) {
-    return wsSend(ws, { type: 'error', message: spawnSpec.error });
+    return wsSend(ws, { type: 'error', sessionId: currentSessionId, viewRequestId: msg.viewRequestId || null, message: spawnSpec.error });
   }
   saveSession(session);
 
@@ -3720,7 +3817,7 @@ function handleMessage(ws, msg, options = {}) {
         });
         cleanRunDir(currentSessionId);
         sendSessionList(ws);
-        wsSend(ws, { type: 'error', message: formatRuntimeError('codex', err?.message || String(err)) });
+        wsSend(ws, { type: 'error', sessionId: currentSessionId, message: formatRuntimeError('codex', err?.message || String(err)) });
       });
     return;
   }
@@ -3765,6 +3862,7 @@ function handleMessage(ws, msg, options = {}) {
     sendSessionList(ws);
     wsSend(ws, {
       type: 'error',
+      sessionId: currentSessionId,
       message: formatRuntimeError(entry.agent, entry.lastError, { exitCode: null, signal: null }),
     });
   };
@@ -4124,6 +4222,7 @@ function handleListNativeSessions(ws) {
 
 function handleImportNativeSession(ws, msg) {
   const { sessionId, projectDir } = msg;
+  const viewRequestId = msg?.viewRequestId || null;
   if (!sessionId || !projectDir) {
     return wsSend(ws, { type: 'error', message: '缺少 sessionId 或 projectDir' });
   }
@@ -4177,6 +4276,7 @@ function handleImportNativeSession(ws, msg) {
     agent: 'claude',
     claudeSessionId: sessionId,
     codexThreadId: null,
+    codexThreadTransport: '',
     importedFrom: projectDir,
     model: existingSession?.model || null,
     permissionMode: existingSession?.permissionMode || 'yolo',
@@ -4189,6 +4289,7 @@ function handleImportNativeSession(ws, msg) {
   wsSessionMap.set(ws, id);
   wsSend(ws, {
     type: 'session_info',
+    viewRequestId,
     sessionId: id,
     messages: session.messages,
     title: session.title,
@@ -4235,6 +4336,7 @@ function handleListCodexSessions(ws) {
 
 function handleImportCodexSession(ws, msg) {
   const threadId = String(msg?.threadId || '').trim();
+  const viewRequestId = msg?.viewRequestId || null;
   if (!threadId) {
     return wsSend(ws, { type: 'error', message: '缺少 threadId' });
   }
@@ -4277,6 +4379,7 @@ function handleImportCodexSession(ws, msg) {
     agent: 'codex',
     claudeSessionId: null,
     codexThreadId: threadId,
+    codexThreadTransport: 'exec',
     importedFrom: 'codex',
     importedRolloutPath: parsed.filePath,
     model: existingSession?.model || null,
@@ -4291,6 +4394,7 @@ function handleImportCodexSession(ws, msg) {
   wsSessionMap.set(ws, id);
   wsSend(ws, {
     type: 'session_info',
+    viewRequestId,
     sessionId: id,
     messages: session.messages,
     title: session.title,
