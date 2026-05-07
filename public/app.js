@@ -1612,7 +1612,7 @@
 
       case 'tool_start':
         if (!isGenerating) startGenerating();
-        activeToolCalls.set(msg.toolUseId, { id: msg.toolUseId, name: msg.name, input: msg.input, kind: msg.kind || null, meta: msg.meta || null, done: false });
+        activeToolCalls.set(msg.toolUseId, { name: msg.name, input: msg.input, kind: msg.kind || null, meta: msg.meta || null, done: false });
         appendToolCall(msg.toolUseId, msg.name, msg.input, false, msg.kind || null, msg.meta || null);
         break;
 
@@ -1690,7 +1690,6 @@
         if (msg.toolCalls && msg.toolCalls.length > 0) {
           for (const tc of msg.toolCalls) {
             activeToolCalls.set(tc.id, {
-              id: tc.id,
               name: tc.name,
               input: tc.input,
               result: tc.result,
@@ -2173,75 +2172,20 @@
     return parsed.questions;
   }
 
-  function extractAskUserResultAnswers(result) {
-    const parsed = normalizeAskUserInput(result);
-    if (!parsed || !parsed.answers || typeof parsed.answers !== 'object') return {};
-    return parsed.answers;
+  function appendAskOptionToInput(question, option) {
+    const header = (question?.header || '').trim() || '问题';
+    const line = `【${header}】${option?.label || ''}`;
+    const current = msgInput.value.trim();
+    msgInput.value = current ? `${current}\n${line}` : line;
+    autoResize();
+    msgInput.focus();
   }
 
-  function hasAskAnswer(questionId, answers) {
-    const value = answers?.[questionId]?.answers;
-    return Array.isArray(value) && value.length > 0;
-  }
-
-  function submitCodexUserInputAnswer(toolUseId, answers) {
-    if (!toolUseId || !currentSessionId) {
-      appendError('无法定位当前 Codex 提问，不能提交回复。');
-      return;
-    }
-    send({
-      type: 'codex_user_input_answer',
-      sessionId: currentSessionId,
-      toolUseId,
-      answers,
-    });
-  }
-
-  function createAskUserQuestionView(questions, toolUseId, done = false, result = null) {
+  function createAskUserQuestionView(questions) {
     const wrapper = document.createElement('div');
     wrapper.className = 'ask-user-question';
-    const submittedAnswers = extractAskUserResultAnswers(result);
-    const selectedAnswers = new Map();
-    const freeInputs = new Map();
-    const optionButtons = new Map();
-    const submitted = done && Object.keys(submittedAnswers).length > 0;
-    let submitBtn = null;
-
-    function questionIdFor(q, idx) {
-      return String(q?.id || `question_${idx + 1}`);
-    }
-
-    function markSelected(questionId, button) {
-      const current = optionButtons.get(questionId) || [];
-      current.forEach((item) => item.classList.toggle('ask-option-selected', item === button));
-    }
-
-    function collectAskAnswers() {
-      const answers = {};
-      for (let idx = 0; idx < questions.length; idx++) {
-        const q = questions[idx] || {};
-        const questionId = questionIdFor(q, idx);
-        const selected = selectedAnswers.get(questionId);
-        const input = freeInputs.get(questionId);
-        const value = selected || (input ? input.value.trim() : '');
-        if (!value) {
-          return { error: `请先回答「${q.header || q.question || `问题 ${idx + 1}`}」。` };
-        }
-        answers[questionId] = { answers: [value] };
-      }
-      return { answers };
-    }
-
-    function updateSubmitState() {
-      if (!submitBtn || submitted) return;
-      submitBtn.disabled = !!collectAskAnswers().error;
-    }
 
     questions.forEach((q, idx) => {
-      const questionId = questionIdFor(q, idx);
-      const submittedValue = hasAskAnswer(questionId, submittedAnswers)
-        ? submittedAnswers[questionId].answers[0]
-        : '';
       const card = document.createElement('div');
       card.className = 'ask-question-card';
 
@@ -2258,49 +2202,67 @@
       if (Array.isArray(q.options) && q.options.length > 0) {
         const hasDesc = q.options.some(o => o.description);
 
+        // 左右分栏容器
         const layout = document.createElement('div');
         layout.className = 'ask-options-layout' + (hasDesc ? ' has-preview' : '');
 
         const opts = document.createElement('div');
         opts.className = 'ask-question-options';
 
+        // 右侧预览区（仅在有 description 时创建）
         const preview = hasDesc ? document.createElement('div') : null;
         if (preview) {
           preview.className = 'ask-option-preview';
-          const selectedOption = q.options.find((opt) => opt.label === submittedValue) || q.options[0];
-          preview.textContent = selectedOption?.description || '';
+          // 默认显示第一项
+          preview.textContent = q.options[0].description || '';
         }
 
-        optionButtons.set(questionId, []);
+        // 当前选中项（移动端 tap-to-preview 状态）
+        let selectedOpt = null;
+        let selectedBtn = null;
+
         q.options.forEach((opt, i) => {
           const item = document.createElement('button');
           item.type = 'button';
           item.className = 'ask-option-item';
-          item.disabled = submitted;
 
           const title = document.createElement('div');
           title.className = 'ask-option-label';
           title.textContent = `${i + 1}. ${opt.label || ''}`;
           item.appendChild(title);
-          if (submittedValue && opt.label === submittedValue) {
-            item.classList.add('ask-option-selected');
-          }
 
+          // 桌面：hover 切换预览
           if (preview) {
             item.addEventListener('mouseenter', () => {
               preview.textContent = opt.description || '';
             });
           }
 
-          item.addEventListener('click', () => {
-            if (submitted) return;
-            selectedAnswers.set(questionId, opt.label || '');
-            markSelected(questionId, item);
-            if (preview) preview.textContent = opt.description || '';
-            updateSubmitState();
+          item.addEventListener('click', (e) => {
+            const isTouch = item.dataset.touchActivated === '1';
+            item.dataset.touchActivated = '';
+
+            if (isTouch) {
+              // 移动端：第一次 tap = 选中预览，不发送
+              if (selectedBtn !== item) {
+                if (selectedBtn) selectedBtn.classList.remove('ask-option-selected');
+                selectedBtn = item;
+                selectedOpt = opt;
+                item.classList.add('ask-option-selected');
+                if (preview) preview.textContent = opt.description || '';
+                return;
+              }
+              // 第二次 tap 同一项 = 发送
+            }
+
+            // 桌面直接发送
+            appendAskOptionToInput(q, opt);
           });
 
-          optionButtons.get(questionId).push(item);
+          item.addEventListener('touchstart', () => {
+            item.dataset.touchActivated = '1';
+          }, { passive: true });
+
           opts.appendChild(item);
         });
 
@@ -2313,50 +2275,27 @@
           });
         }
 
-        card.appendChild(layout);
-      }
+        // 移动端确认按钮
+        if (hasDesc) {
+          const confirmBtn = document.createElement('button');
+          confirmBtn.type = 'button';
+          confirmBtn.className = 'ask-confirm-btn';
+          confirmBtn.textContent = '确认选择';
+          confirmBtn.addEventListener('click', () => {
+            if (selectedOpt) {
+              appendAskOptionToInput(q, selectedOpt);
+            } else if (q.options.length > 0) {
+              appendAskOptionToInput(q, q.options[0]);
+            }
+          });
+          layout.appendChild(confirmBtn);
+        }
 
-      if (!Array.isArray(q.options) || q.options.length === 0 || q.isOther) {
-        const input = document.createElement('input');
-        input.className = 'ask-answer-input';
-        input.type = q.isSecret ? 'password' : 'text';
-        input.placeholder = '输入回复';
-        input.disabled = submitted;
-        input.value = submittedValue;
-        input.addEventListener('input', updateSubmitState);
-        freeInputs.set(questionId, input);
-        card.appendChild(input);
+        card.appendChild(layout);
       }
 
       wrapper.appendChild(card);
     });
-
-    if (submitted) {
-      const status = document.createElement('div');
-      status.className = 'ask-submit-status';
-      status.textContent = '已提交，Codex 正在继续处理。';
-      wrapper.appendChild(status);
-    } else {
-      submitBtn = document.createElement('button');
-      submitBtn.type = 'button';
-      submitBtn.className = 'ask-submit-btn';
-      submitBtn.textContent = '提交回复';
-      submitBtn.disabled = true;
-      submitBtn.addEventListener('click', () => {
-        const payload = collectAskAnswers();
-        if (payload.error) {
-          appendError(payload.error);
-          updateSubmitState();
-          return;
-        }
-        submitBtn.disabled = true;
-        submitBtn.textContent = '已提交';
-        wrapper.querySelectorAll('button, input').forEach((el) => { el.disabled = true; });
-        submitCodexUserInputAnswer(toolUseId, payload.answers);
-      });
-      wrapper.appendChild(submitBtn);
-      updateSubmitState();
-    }
 
     return wrapper;
   }
@@ -2370,7 +2309,7 @@
     if (effectiveName === 'AskUserQuestion') {
       const questions = extractAskUserQuestions(effectiveInput);
       if (questions.length > 0) {
-        return createAskUserQuestionView(questions, tool.id, !!tool.done, effectiveResult);
+        return createAskUserQuestionView(questions);
       }
     }
 
@@ -2507,13 +2446,13 @@
       kind: el.dataset.toolKind || null,
       done: true,
     };
-    tool.id = toolUseId;
     tool.done = true;
     if (result !== undefined) tool.result = result;
     const summary = el.querySelector('summary');
     if (summary) applyToolSummary(summary, tool, true);
+    if (tool.name === 'AskUserQuestion') return;
     const nextContent = buildToolContentElement(tool);
-    const content = Array.from(el.children).find((child) => child.tagName !== 'SUMMARY');
+    const content = el.querySelector('.tool-call-content');
     if (content) content.replaceWith(nextContent);
   }
 
