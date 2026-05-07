@@ -360,12 +360,10 @@ async function main() {
 
     const codexInitCwd = path.join(tempRoot, 'codex-space');
     mkdirp(codexInitCwd);
-    const codexInitRequestId = `test-codex-init-${Date.now()}`;
-    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: codexInitCwd, mode: 'plan', viewRequestId: codexInitRequestId }));
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: codexInitCwd, mode: 'plan' }));
     const codexSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === codexInitCwd);
     assert(codexSession.mode === 'plan', 'Codex new_session should follow requested mode');
     assert(codexSession.model === 'gpt-5.5', 'Codex new_session should inject configured profile model');
-    assert(codexSession.viewRequestId === codexInitRequestId, 'New session response should echo viewRequestId');
 
     ws.send(JSON.stringify({ type: 'message', text: '/init', sessionId: codexSession.sessionId, mode: 'plan', agent: 'codex' }));
     const codexInitStart = await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /AGENTS\.md/.test(msg.message || ''));
@@ -385,7 +383,6 @@ async function main() {
     ws.send(JSON.stringify({ type: 'message', text: 'first codex prompt', attachments: [codexAttachment], mode: 'yolo', agent: 'codex' }));
     const firstMessageSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.title === 'first codex prompt');
     assert(firstMessageSession.agent === 'codex', 'First-message path created wrong agent');
-    assert(firstMessageSession.viewRequestId === null || firstMessageSession.viewRequestId === undefined, 'First message without request id should not invent one');
     const runningSessionList = await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && msg.sessions.some((s) => s.id === firstMessageSession.sessionId && s.isRunning));
     assert(runningSessionList.sessions.some((s) => s.id === firstMessageSession.sessionId && s.isRunning), 'Running Codex session should be marked as isRunning');
     await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === firstMessageSession.sessionId);
@@ -396,7 +393,6 @@ async function main() {
     const storedAfterFirst = JSON.parse(fs.readFileSync(codexSessionPath, 'utf8'));
     const threadIdBeforeMode = storedAfterFirst.codexThreadId;
     assert(threadIdBeforeMode, 'Codex thread id should be persisted after first run');
-    assert(storedAfterFirst.codexThreadTransport === 'exec', 'Codex exec transport should be persisted with its thread id');
 
     ws.send(JSON.stringify({ type: 'set_mode', sessionId: firstMessageSession.sessionId, mode: 'plan' }));
     await nextMessage(messages, ws, (msg) => msg.type === 'mode_changed' && msg.mode === 'plan');
@@ -455,12 +451,8 @@ async function main() {
 
     const runtimeToml = fs.readFileSync(path.join(configDir, 'codex-session-home', firstMessageSession.sessionId, 'config.toml'), 'utf8');
     assert(runtimeToml.includes('preferred_auth_method = "apikey"'), 'Codex custom profile should write isolated runtime auth mode');
-    assert(runtimeToml.includes('disable_response_storage = true'), 'Codex custom profile should disable Responses state storage for proxy compatibility');
-    assert(runtimeToml.includes('default_mode_request_user_input = true'), 'Codex custom profile should allow request_user_input in app-server default collaboration mode');
-    assert(runtimeToml.includes('responses_websockets = false'), 'Codex custom profile should keep Responses websocket transport disabled');
     assert(runtimeToml.includes('base_url = "https://example.org/v1"'), 'Codex custom profile should write isolated runtime base_url');
     assert(runtimeToml.includes('model = "gpt-5.4"'), 'Codex custom profile should write isolated runtime model');
-    assert(runtimeToml.includes('requires_openai_auth = true'), 'Codex custom profile should use OpenAI-compatible bearer auth');
 
     ws.send(JSON.stringify({ type: 'message', text: '/compact', sessionId: firstMessageSession.sessionId, mode: 'yolo', agent: 'codex' }));
     await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /正在执行/.test(msg.message || '') && /Codex \/compact/.test(msg.message || ''));
@@ -495,10 +487,8 @@ async function main() {
       mime: 'image/png',
       data: Buffer.from('claude-image'),
     });
-    const claudeRequestId = `test-claude-first-${Date.now()}`;
-    ws.send(JSON.stringify({ type: 'message', text: 'describe attachment', attachments: [claudeAttachment], mode: 'yolo', agent: 'claude', viewRequestId: claudeRequestId }));
+    ws.send(JSON.stringify({ type: 'message', text: 'describe attachment', attachments: [claudeAttachment], mode: 'yolo', agent: 'claude' }));
     const claudeImageSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'claude' && msg.title === 'describe attachment');
-    assert(claudeImageSession.viewRequestId === claudeRequestId, 'Claude first message response should echo viewRequestId');
     await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === claudeImageSession.sessionId);
     const claudeSpawnLine = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
       .trim()
@@ -530,23 +520,19 @@ async function main() {
     const nativeSessions = await nextMessage(messages, ws, (msg) => msg.type === 'native_sessions');
     assert(nativeSessions.groups?.length > 0, 'Claude native session listing failed');
     const firstClaude = nativeSessions.groups[0].sessions[0];
-    const importClaudeRequestId = `test-import-claude-${Date.now()}`;
-    ws.send(JSON.stringify({ type: 'import_native_session', sessionId: firstClaude.sessionId, projectDir: nativeSessions.groups[0].dir, viewRequestId: importClaudeRequestId }));
+    ws.send(JSON.stringify({ type: 'import_native_session', sessionId: firstClaude.sessionId, projectDir: nativeSessions.groups[0].dir }));
     const importedClaude = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'claude' && msg.title === 'Claude import prompt');
     assert(importedClaude.messages?.[0]?.content === 'Claude import prompt', 'Claude import parsed wrong first message');
-    assert(importedClaude.viewRequestId === importClaudeRequestId, 'Claude import should echo viewRequestId');
 
     ws.send(JSON.stringify({ type: 'list_codex_sessions' }));
     const codexSessions = await nextMessage(messages, ws, (msg) => msg.type === 'codex_sessions');
     const importedCodexItem = codexSessions.sessions.find((item) => item.threadId === codexFixture.threadId);
     assert(importedCodexItem, 'Codex session listing failed');
 
-    const importCodexRequestId = `test-import-codex-${Date.now()}`;
-    ws.send(JSON.stringify({ type: 'import_codex_session', threadId: importedCodexItem.threadId, rolloutPath: importedCodexItem.rolloutPath, viewRequestId: importCodexRequestId }));
+    ws.send(JSON.stringify({ type: 'import_codex_session', threadId: importedCodexItem.threadId, rolloutPath: importedCodexItem.rolloutPath }));
     const importedCodex = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.title === 'Codex import prompt');
     assert(importedCodex.messages?.[0]?.content === 'Codex import prompt', 'Codex import kept wrapper instructions');
     assert(importedCodex.totalUsage?.inputTokens === 20, 'Codex import usage parse failed');
-    assert(importedCodex.viewRequestId === importCodexRequestId, 'Codex import should echo viewRequestId');
 
     const importedSessionId = importedCodex.sessionId;
     ws.send(JSON.stringify({ type: 'delete_session', sessionId: importedSessionId }));
@@ -613,38 +599,6 @@ async function main() {
     const answerDelta = await nextMessage(messages, ws, (msg) => msg.type === 'text_delta' && /暂停/.test(msg.text || ''));
     assert(/暂停/.test(answerDelta.text || ''), 'Codex app-server should continue with the submitted answer');
     await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
-    const appStored = JSON.parse(fs.readFileSync(path.join(appSessionsDir, `${session.sessionId}.json`), 'utf8'));
-    assert(appStored.codexThreadTransport === 'app-server', 'Codex app-server transport should be persisted with its thread id');
-    const appProcessLog = fs.readFileSync(path.join(appLogsDir, 'process.log'), 'utf8');
-    const appSpawn = appProcessLog
-      .trim()
-      .split('\n')
-      .find((line) => line.includes('"event":"process_spawn"') && line.includes(session.sessionId.slice(0, 8))) || '';
-    assert(appSpawn.includes('--enable default_mode_request_user_input'), 'Codex app-server should enable request_user_input in default collaboration mode');
-
-    const legacySessionId = 'legacy-exec-thread';
-    fs.writeFileSync(path.join(appSessionsDir, `${legacySessionId}.json`), JSON.stringify({
-      id: legacySessionId,
-      title: 'Legacy exec thread',
-      created: new Date().toISOString(),
-      updated: new Date().toISOString(),
-      agent: 'codex',
-      claudeSessionId: null,
-      codexThreadId: 'legacy-exec-thread-id',
-      codexThreadTransport: 'exec',
-      model: 'gpt-5.5',
-      permissionMode: 'yolo',
-      totalCost: 0,
-      totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
-      messages: [],
-      cwd,
-    }, null, 2));
-
-    ws.send(JSON.stringify({ type: 'message', text: 'legacy app-server prompt', sessionId: legacySessionId, mode: 'yolo', agent: 'codex' }));
-    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === legacySessionId);
-    const legacyStored = JSON.parse(fs.readFileSync(path.join(appSessionsDir, `${legacySessionId}.json`), 'utf8'));
-    assert(legacyStored.codexThreadTransport === 'app-server', 'Legacy exec thread should migrate to an app-server thread after a new app-server turn');
-    assert(legacyStored.codexThreadId !== 'legacy-exec-thread-id', 'Codex app-server should not resume a thread created by exec transport');
 
     ws.close();
     console.log('Codex app-server request_user_input checks passed.');

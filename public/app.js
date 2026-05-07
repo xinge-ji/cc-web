@@ -97,8 +97,6 @@
   let codexConfigCache = null;
   let loadedHistorySessionId = null;
   let activeSessionLoad = null;
-  let viewRequestSeq = 0;
-  let pendingViewRequestId = null;
   let sidebarSwipe = null;
   let pendingAttachments = [];
   let uploadingAttachments = [];
@@ -156,51 +154,6 @@
   function buildWelcomeMarkup(agent) {
     const label = AGENT_LABELS[agent] || AGENT_LABELS.claude;
     return `<div class="welcome-msg"><div class="welcome-icon">✿</div><h3>欢迎使用 CC-Web</h3><p>开始与 ${label} 对话</p></div>`;
-  }
-
-  function nextViewRequestId() {
-    viewRequestSeq += 1;
-    return `view-${Date.now()}-${viewRequestSeq}`;
-  }
-
-  function beginPendingViewRequest() {
-    renderEpoch++;
-    const requestId = nextViewRequestId();
-    pendingViewRequestId = requestId;
-    setSessionLoading(null, { blocking: false });
-    return requestId;
-  }
-
-  function cancelPendingViewRequest() {
-    pendingViewRequestId = null;
-  }
-
-  function isCurrentSessionMessage(msg) {
-    if (msg?.viewRequestId) {
-      return activeSessionLoad?.requestId === msg.viewRequestId ||
-        pendingViewRequestId === msg.viewRequestId;
-    }
-    if (!msg?.sessionId) return true;
-    if (activeSessionLoad) return msg.sessionId === activeSessionLoad.sessionId;
-    if (pendingViewRequestId) return false;
-    return msg.sessionId === currentSessionId;
-  }
-
-  function shouldApplySessionInfo(msg) {
-    if (!msg?.sessionId) return false;
-    if (msg.viewRequestId) {
-      return activeSessionLoad?.requestId === msg.viewRequestId ||
-        pendingViewRequestId === msg.viewRequestId;
-    }
-    if (pendingViewRequestId && msg.sessionId !== currentSessionId) return false;
-    if (activeSessionLoad) return activeSessionLoad.sessionId === msg.sessionId;
-    return !currentSessionId || msg.sessionId === currentSessionId;
-  }
-
-  function finishPendingViewRequest(msg) {
-    if (msg?.viewRequestId && pendingViewRequestId === msg.viewRequestId) {
-      pendingViewRequestId = null;
-    }
   }
 
   function normalizeAgent(agent) {
@@ -1255,7 +1208,7 @@
   function setSessionLoading(sessionId, options = {}) {
     const loading = !!sessionId;
     const blocking = options.blocking !== false;
-    activeSessionLoad = loading ? { sessionId, blocking, requestId: options.requestId || null, snapshot: null } : null;
+    activeSessionLoad = loading ? { sessionId, blocking, snapshot: null } : null;
     const showOverlay = !!(loading && blocking);
     document.body.classList.toggle('session-loading-active', showOverlay);
     sessionLoadingOverlay.hidden = !showOverlay;
@@ -1270,7 +1223,7 @@
     }
   }
 
-  function clearSessionLoading(sessionId, options = {}) {
+  function clearSessionLoading(sessionId) {
     if (sessionId && activeSessionLoad && activeSessionLoad.sessionId !== sessionId) return;
     setSessionLoading(null, { blocking: false });
   }
@@ -1304,12 +1257,10 @@
     const force = options.force === true;
     if (!force && activeSessionLoad?.sessionId === sessionId) return;
     if (!force && sessionId === currentSessionId && !activeSessionLoad) return;
-    const requestId = nextViewRequestId();
     renderEpoch++;
-    pendingViewRequestId = null;
     loadedHistorySessionId = null;
-    setSessionLoading(sessionId, { blocking, label: options.label, requestId });
-    send({ type: 'load_session', sessionId, viewRequestId: requestId });
+    setSessionLoading(sessionId, { blocking, label: options.label });
+    send({ type: 'load_session', sessionId });
   }
 
   function showCachedSession(sessionId) {
@@ -1604,14 +1555,11 @@
           pendingInitialSessionLoad = false;
           syncViewForAgent(currentAgent, { preserveCurrent: false, loadLast: true });
         } else if (currentSessionId && !getSessionMeta(currentSessionId)) {
-          cancelPendingViewRequest();
           resetChatView(currentAgent);
         }
         break;
 
       case 'session_info':
-        if (!shouldApplySessionInfo(msg)) return;
-        cancelPendingViewRequest();
         const snapshot = normalizeSessionSnapshot(msg);
         if (activeSessionLoad?.sessionId === msg.sessionId) {
           activeSessionLoad.snapshot = snapshot;
@@ -1628,14 +1576,11 @@
             cacheSessionSnapshot(snapshot);
             finishSessionSwitch(msg.sessionId);
           }
-          finishPendingViewRequest(msg);
         }
         break;
 
       case 'session_history_chunk':
-        if (msg.sessionId === currentSessionId &&
-          loadedHistorySessionId === msg.sessionId &&
-          (!msg.viewRequestId || activeSessionLoad?.requestId === msg.viewRequestId)) {
+        if (msg.sessionId === currentSessionId && loadedHistorySessionId === msg.sessionId) {
           const blocking = isBlockingSessionLoad(msg.sessionId);
           if (activeSessionLoad?.sessionId === msg.sessionId && activeSessionLoad.snapshot) {
             activeSessionLoad.snapshot.messages = cloneMessages(msg.messages || []).concat(activeSessionLoad.snapshot.messages);
@@ -1660,21 +1605,18 @@
         break;
 
       case 'text_delta':
-        if (!isCurrentSessionMessage(msg)) return;
         if (!isGenerating) startGenerating();
         pendingText += msg.text;
         scheduleRender();
         break;
 
       case 'tool_start':
-        if (!isCurrentSessionMessage(msg)) return;
         if (!isGenerating) startGenerating();
         activeToolCalls.set(msg.toolUseId, { id: msg.toolUseId, name: msg.name, input: msg.input, kind: msg.kind || null, meta: msg.meta || null, done: false });
         appendToolCall(msg.toolUseId, msg.name, msg.input, false, msg.kind || null, msg.meta || null);
         break;
 
       case 'tool_end':
-        if (!isCurrentSessionMessage(msg)) return;
         if (activeToolCalls.has(msg.toolUseId)) {
           activeToolCalls.get(msg.toolUseId).done = true;
           if (msg.kind) activeToolCalls.get(msg.toolUseId).kind = msg.kind;
@@ -1685,58 +1627,51 @@
         break;
 
       case 'cost':
-        if (!isCurrentSessionMessage(msg)) return;
         costDisplay.textContent = `$${msg.costUsd.toFixed(4)}`;
-        if (msg.sessionId || currentSessionId) {
-          updateCachedSession(msg.sessionId || currentSessionId, (snapshot) => { snapshot.totalCost = msg.costUsd; });
+        if (currentSessionId) {
+          updateCachedSession(currentSessionId, (snapshot) => { snapshot.totalCost = msg.costUsd; });
         }
         break;
 
       case 'usage':
-        if (!isCurrentSessionMessage(msg)) return;
         if (msg.totalUsage) {
           const cacheText = msg.totalUsage.cachedInputTokens ? ` · cache ${msg.totalUsage.cachedInputTokens}` : '';
           costDisplay.textContent = `in ${msg.totalUsage.inputTokens} · out ${msg.totalUsage.outputTokens}${cacheText}`;
-          if (msg.sessionId || currentSessionId) {
-            updateCachedSession(msg.sessionId || currentSessionId, (snapshot) => { snapshot.totalUsage = deepClone(msg.totalUsage); });
+          if (currentSessionId) {
+            updateCachedSession(currentSessionId, (snapshot) => { snapshot.totalUsage = deepClone(msg.totalUsage); });
           }
         }
         break;
 
       case 'done':
-        if (!isCurrentSessionMessage(msg)) return;
         finishGenerating(msg.sessionId);
         break;
 
       case 'system_message':
-        if (!isCurrentSessionMessage(msg)) return;
         appendSystemMessage(msg.message);
         break;
 
       case 'mode_changed':
-        if (!isCurrentSessionMessage(msg)) return;
         if (msg.mode && MODE_LABELS[msg.mode]) {
           currentMode = msg.mode;
           modeSelect.value = currentMode;
           localStorage.setItem(getAgentModeStorageKey(currentAgent), currentMode);
-          if (msg.sessionId || currentSessionId) {
-            updateCachedSession(msg.sessionId || currentSessionId, (snapshot) => { snapshot.mode = msg.mode; });
+          if (currentSessionId) {
+            updateCachedSession(currentSessionId, (snapshot) => { snapshot.mode = msg.mode; });
           }
         }
         break;
 
       case 'model_changed':
-        if (!isCurrentSessionMessage(msg)) return;
         if (msg.model) {
           currentModel = msg.model;
-          if (msg.sessionId || currentSessionId) {
-            updateCachedSession(msg.sessionId || currentSessionId, (snapshot) => { snapshot.model = msg.model; });
+          if (currentSessionId) {
+            updateCachedSession(currentSessionId, (snapshot) => { snapshot.model = msg.model; });
           }
         }
         break;
 
       case 'resume_generating':
-        if (!isCurrentSessionMessage(msg)) return;
         // Server has an active process for this session — resume streaming
         setCurrentSessionRunningState(true);
         if (!isGenerating || !document.getElementById('streaming-msg')) {
@@ -1772,8 +1707,6 @@
         break;
 
       case 'error':
-        if (!isCurrentSessionMessage(msg)) return;
-        cancelPendingViewRequest();
         appendError(msg.message);
         clearSessionLoading();
         if (!isGenerating && currentSessionId) {
@@ -4866,8 +4799,7 @@
         }
         close();
         saveRecentCwd(cwd);
-        const viewRequestId = beginPendingViewRequest();
-        send({ type: 'new_session', cwd, agent: targetAgent, mode: currentMode, taskMode: 'local', viewRequestId });
+        send({ type: 'new_session', cwd, agent: targetAgent, mode: currentMode, taskMode: 'local' });
       } else {
         // Remote task
         if (!selectedHostId) {
@@ -4876,8 +4808,7 @@
         }
         const remoteCwd = remoteView.querySelector('#ns-remote-cwd')?.value?.trim() || '';
         close();
-        const viewRequestId = beginPendingViewRequest();
-        send({ type: 'new_session', agent: targetAgent, mode: currentMode, taskMode: 'remote', sshHostId: selectedHostId, remoteCwd, viewRequestId });
+        send({ type: 'new_session', agent: targetAgent, mode: currentMode, taskMode: 'remote', sshHostId: selectedHostId, remoteCwd });
       }
     });
   }
@@ -5015,8 +4946,7 @@
               if (!confirm('由于 cc-web 与本地 CLI 的逻辑不同，导入会话需要解析后方可展示，导入后将覆盖已有内容。确认继续？')) return;
             }
             close();
-            const viewRequestId = beginPendingViewRequest();
-            send({ type: 'import_native_session', sessionId: sess.sessionId, projectDir: group.dir, viewRequestId });
+            send({ type: 'import_native_session', sessionId: sess.sessionId, projectDir: group.dir });
           });
           item.appendChild(info);
           item.appendChild(btn);
@@ -5099,8 +5029,7 @@
               : confirm('将解析本地 Codex rollout 历史并导入当前 Web 视图。确认继续？');
             if (!confirmed) return;
             close();
-            const viewRequestId = beginPendingViewRequest();
-            send({ type: 'import_codex_session', threadId: sess.threadId, rolloutPath: sess.rolloutPath, viewRequestId });
+            send({ type: 'import_codex_session', threadId: sess.threadId, rolloutPath: sess.rolloutPath });
           });
 
           item.appendChild(info);
@@ -5161,9 +5090,7 @@
     } else if (ws.readyState === 1 && currentSessionId) {
       // Preserve active streaming UI when returning to foreground.
       if (isGenerating || currentSessionRunning) {
-        const requestId = nextViewRequestId();
-        activeSessionLoad = { sessionId: currentSessionId, blocking: false, requestId, snapshot: null };
-        send({ type: 'load_session', sessionId: currentSessionId, viewRequestId: requestId });
+        send({ type: 'load_session', sessionId: currentSessionId });
       } else {
         beginSessionSwitch(currentSessionId, { blocking: false, force: true });
       }
