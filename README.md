@@ -1,6 +1,6 @@
 # CC-Web
 
-Claude Code / Codex 轻量级 Web 远程工具 — 在浏览器中与本机 CLI Agent 交互。
+Claude Code / Codex / Pi 轻量级 Web 远程工具 — 在浏览器中与本机 CLI Agent 交互。
 
 ![Node.js](https://img.shields.io/badge/Node.js-22+-339933?logo=node.js&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue)
@@ -25,16 +25,16 @@ https://github.com/ZgDaniel/cc-web 给我装！
 ## 功能特性
 
 - **超轻量** — 后端性能占用少，前端通过 web 访问
-- **多会话管理** — 创建、切换、重命名、删除会话，删除时同步清除本地 Claude 历史记录
-- **本地历史导入** — Claude 可导入 `~/.claude/projects/` 会话；Codex 可导入 `~/.codex/sessions/` rollout 历史
-- **后台任务** — 关闭浏览器后 Claude 进程继续运行，完成后推送通知，支持 PushPlus / Telegram / Server酱 / 飞书机器人 / QQ（Qmsg）
+- **多会话管理** — 创建、切换、重命名、删除 Claude / Codex / Pi 会话
+- **本地历史导入** — Claude 可导入 `~/.claude/projects/` 会话；Codex 可导入 `~/.codex/sessions/` rollout 历史；Pi 可导入 `~/.pi/agent/sessions/` JSONL 历史
+- **后台任务** — 关闭浏览器后本机 Agent 进程继续运行，完成后推送通知，支持 PushPlus / Telegram / Server酱 / 飞书机器人 / QQ（Qmsg）
 - **多 API 切换** — 可配置多个 API 方案，一键切换，即时生效
 - **开发者配置** — 可保存主机SSH信息、github token，实现快速管理远程主机、管理github仓库
 
 ## 前提条件
 
 - **Node.js** >= 18
-- **Claude Code CLI** 或 **Codex CLI** 已安装并配置
+- **Claude Code CLI**、**Codex CLI** 或 **Pi CLI** 已安装并配置
   ```bash
   npm install -g @anthropic-ai/claude-code
   npm install -g @openai/codex
@@ -76,6 +76,7 @@ copy .env.example .env  & REM 可选
 | `PORT` | 否 | `8002` | 服务监听端口 |
 | `CLAUDE_PATH` | 否 | `claude` | Claude CLI 可执行文件路径 |
 | `CODEX_PATH` | 否 | `codex` | Codex CLI 可执行文件路径 |
+| `PI_PATH` | 否 | `pi` | Pi CLI 可执行文件路径 |
 | `CC_WEB_CONFIG_DIR` | 否 | `./config` | 配置目录覆写（主要供隔离测试使用） |
 | `CC_WEB_SESSIONS_DIR` | 否 | `./sessions` | 会话目录覆写（主要供隔离测试使用） |
 | `CC_WEB_LOGS_DIR` | 否 | `./logs` | 日志目录覆写（主要供隔离测试使用） |
@@ -111,8 +112,9 @@ copy .env.example .env  & REM 可选
 cc-web/
 ├── server.js              # Node.js 后端（HTTP + WebSocket + 进程管理 + 通知）
 ├── lib/
-│   ├── agent-runtime.js    # Claude / Codex 运行时适配层
-│   └── codex-rollouts.js   # Codex rollout 历史解析
+│   ├── agent-runtime.js    # Claude / Codex / Pi 运行时适配层
+│   ├── codex-rollouts.js   # Codex rollout 历史解析
+│   └── pi-sessions.js      # Pi JSONL 会话历史解析
 ├── public/
 │   ├── index.html          # 页面结构
 │   ├── app.js              # 前端逻辑（WebSocket 通信、UI 交互）
@@ -127,7 +129,8 @@ cc-web/
 ├── scripts/
 │   ├── regression.js       # 隔离式回归脚本
 │   ├── mock-claude.js      # 回归用 mock Claude CLI
-│   └── mock-codex.js       # 回归用 mock Codex CLI
+│   ├── mock-codex.js       # 回归用 mock Codex CLI
+│   └── mock-pi.js          # 回归用 mock Pi CLI
 ├── .env.example            # 环境变量模板
 ├── start.bat               # Windows 一键启动脚本
 ├── .gitignore
@@ -140,19 +143,19 @@ cc-web/
 ### 进程模型
 
 ```
-浏览器 ←WebSocket→ Node.js (server.js) ←文件I/O→ Claude / Codex CLI (detached)
+浏览器 ←WebSocket→ Node.js (server.js) ←文件I/O→ Claude / Codex / Pi CLI (detached)
 ```
 
-- 每条用户消息会根据当前会话 Agent，spawn Claude 或 Codex 子进程
+- 每条用户消息会根据当前会话 Agent，spawn Claude、Codex 或 Pi 子进程
 - 进程使用 `detached: true` + `proc.unref()`，独立于 Node.js 生命周期
 - stdin/stdout/stderr 通过文件传递（`sessions/{id}-run/`），不使用 pipe
 - PID 持久化到文件，服务重启后自动恢复（`recoverProcesses()`）
 - 使用 `FileTailer` 实时监听输出文件变化，流式推送给前端
-- Claude / Codex 的 spawn spec 与事件解析分别由 `lib/agent-runtime.js` 管理
+- Claude / Codex / Pi 的 spawn spec 与事件解析由 `lib/agent-runtime.js` 管理
 
 ### 后台任务流程
 
-1. 用户发送消息 → spawn Claude 进程
+1. 用户发送消息 → spawn 当前会话对应的 Agent 进程
 2. 用户关闭浏览器 → 进程继续运行（detached）
 3. 进程完成 → PID 监控检测到退出
 4. 发送推送通知（PushPlus/Telegram/...）
@@ -217,6 +220,7 @@ WorkingDirectory=/mnt/c/Project/cc-web
 Environment=HOME=/root
 Environment=PATH=/root/.nvm/versions/node/v20.19.4/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=CODEX_PATH=/root/.nvm/versions/node/v20.19.4/bin/codex
+Environment=PI_PATH=/root/.nvm/versions/node/v20.19.4/bin/pi
 ExecStart=/root/.nvm/versions/node/v20.19.4/bin/node /mnt/c/Project/cc-web/server.js
 Restart=on-failure
 RestartSec=5

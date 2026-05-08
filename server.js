@@ -6,6 +6,7 @@ const { spawn, spawnSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 const { createAgentRuntime } = require('./lib/agent-runtime');
 const { createCodexRolloutStore } = require('./lib/codex-rollouts');
+const { createPiSessionStore } = require('./lib/pi-sessions');
 
 // Load .env
 const envPath = path.join(__dirname, '.env');
@@ -19,6 +20,7 @@ if (fs.existsSync(envPath)) {
 const PORT = parseInt(process.env.PORT) || 8002;
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
 const CODEX_PATH = process.env.CODEX_PATH || 'codex';
+const PI_PATH = process.env.PI_PATH || 'pi';
 const CONFIG_DIR = process.env.CC_WEB_CONFIG_DIR || path.join(__dirname, 'config');
 const SESSIONS_DIR = process.env.CC_WEB_SESSIONS_DIR || path.join(__dirname, 'sessions');
 const PUBLIC_DIR = process.env.CC_WEB_PUBLIC_DIR || path.join(__dirname, 'public');
@@ -238,7 +240,7 @@ function buildSummaryPrompt(sessionTitle, lastUserMsg, fullText, isError, errorD
 async function buildNotifyContent(entry, session, completionError, contextLimitExceeded) {
   const title = session?.title || 'Untitled';
   const agent = entry.agent || 'claude';
-  const agentLabel = agent === 'codex' ? 'Codex' : 'Claude';
+  const agentLabel = agent === 'codex' ? 'Codex' : agent === 'pi' ? 'Pi' : 'Claude';
   const hasTools = (entry.toolCalls || []).length > 0;
 
   // Determine notify title
@@ -556,13 +558,14 @@ let MODEL_MAP = {
   haiku: 'claude-haiku-4-5-20251001',
 };
 
-const VALID_AGENTS = new Set(['claude', 'codex']);
+const VALID_AGENTS = new Set(['claude', 'codex', 'pi']);
 
 // Final fallback only. New Codex sessions prefer:
 // 1) active custom profile model
 // 2) ~/.codex/config.toml top-level model
 // 3) this constant
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
+const DEFAULT_PI_MODEL = '';
 
 // === Model Config ===
 const DEFAULT_MODEL_CONFIG = {
@@ -654,6 +657,33 @@ function resolveDefaultCodexModel() {
   }
   const localModel = String(readCodexLocalConfigSnapshot().config.model || '').trim();
   return localModel || DEFAULT_CODEX_MODEL;
+}
+
+function readPiLocalConfigSnapshot() {
+  const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+  const settingsPath = path.join(homeDir, '.pi', 'agent', 'settings.json');
+  const config = { defaultProvider: '', defaultModel: '', defaultThinkingLevel: '' };
+  let sourceFound = false;
+  try {
+    if (fs.existsSync(settingsPath)) {
+      sourceFound = true;
+      const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+      config.defaultProvider = String(settings.defaultProvider || '').trim();
+      config.defaultModel = String(settings.defaultModel || '').trim();
+      config.defaultThinkingLevel = String(settings.defaultThinkingLevel || '').trim();
+    }
+  } catch {}
+  return { config, sourceFound };
+}
+
+function resolveDefaultPiModel() {
+  const { config } = readPiLocalConfigSnapshot();
+  const model = String(config.defaultModel || '').trim();
+  if (!model) return DEFAULT_PI_MODEL;
+  const provider = String(config.defaultProvider || '').trim();
+  const base = model.includes('/') || !provider ? model : `${provider}/${model}`;
+  const thinking = String(config.defaultThinkingLevel || '').trim();
+  return thinking ? `${base}:${thinking}` : base;
 }
 
 function loadModelConfig() {
@@ -842,6 +872,7 @@ function handleSaveDevConfig(ws, msg) {
 }
 
 const CODEX_RUNTIME_HOME = path.join(CONFIG_DIR, 'codex-runtime-home');
+const PI_WEB_SESSIONS_DIR = path.join(CONFIG_DIR, 'pi-sessions');
 
 function tomlString(value) {
   return JSON.stringify(String(value || ''));
@@ -864,6 +895,12 @@ function normalizeCodexRuntimeApiBase(apiBase) {
 
 function codexSessionHomeDir(sessionId) {
   return path.join(CONFIG_DIR, 'codex-session-home', sanitizeId(sessionId || 'default'));
+}
+
+function piSessionDir(sessionId) {
+  const dir = path.join(PI_WEB_SESSIONS_DIR, sanitizeId(sessionId || 'default'));
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
 }
 
 function walkJsonlFiles(dir, files = []) {
@@ -1224,6 +1261,9 @@ function normalizeSession(session) {
   if (!Object.prototype.hasOwnProperty.call(session, 'codexThreadId')) session.codexThreadId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'codexHomeDir')) session.codexHomeDir = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'codexRuntimeKey')) session.codexRuntimeKey = '';
+  if (!Object.prototype.hasOwnProperty.call(session, 'piSessionId')) session.piSessionId = null;
+  if (!Object.prototype.hasOwnProperty.call(session, 'piSessionFile')) session.piSessionFile = '';
+  if (!Object.prototype.hasOwnProperty.call(session, 'piSessionDir')) session.piSessionDir = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'totalCost')) session.totalCost = 0;
   if (!Object.prototype.hasOwnProperty.call(session, 'totalUsage') || !session.totalUsage) {
     session.totalUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
@@ -1252,17 +1292,29 @@ function isClaudeSession(session) {
   return getSessionAgent(session) === 'claude';
 }
 
+function isCodexSession(session) {
+  return getSessionAgent(session) === 'codex';
+}
+
+function isPiSession(session) {
+  return getSessionAgent(session) === 'pi';
+}
+
 function getRuntimeSessionId(session) {
   if (!session) return null;
-  return getSessionAgent(session) === 'codex'
-    ? (session.codexThreadId || null)
-    : (session.claudeSessionId || null);
+  const agent = getSessionAgent(session);
+  if (agent === 'codex') return session.codexThreadId || null;
+  if (agent === 'pi') return session.piSessionId || null;
+  return session.claudeSessionId || null;
 }
 
 function setRuntimeSessionId(session, runtimeId) {
   if (!session) return;
-  if (getSessionAgent(session) === 'codex') {
+  const agent = getSessionAgent(session);
+  if (agent === 'codex') {
     session.codexThreadId = runtimeId || null;
+  } else if (agent === 'pi') {
+    session.piSessionId = runtimeId || null;
   } else {
     session.claudeSessionId = runtimeId || null;
   }
@@ -1439,9 +1491,8 @@ function formatRuntimeError(agent, raw, context = {}) {
   const condensed = condenseRuntimeError(raw);
   const exitInfo = typeof context.exitCode === 'number' ? `（退出码 ${context.exitCode}）` : '';
   if (!condensed) {
-    return agent === 'codex'
-      ? `Codex 任务异常结束${exitInfo}，但 CLI 没有返回更多错误信息。`
-      : `Claude 任务异常结束${exitInfo}，但 CLI 没有返回更多错误信息。`;
+    const label = agent === 'codex' ? 'Codex' : agent === 'pi' ? 'Pi' : 'Claude';
+    return `${label} 任务异常结束${exitInfo}，但 CLI 没有返回更多错误信息。`;
   }
 
   if (agent === 'codex') {
@@ -1472,6 +1523,28 @@ function formatRuntimeError(agent, raw, context = {}) {
     return `Codex 任务失败${exitInfo}：${condensed}`;
   }
 
+  if (agent === 'pi') {
+    if (/ENOENT|not found|No such file/i.test(condensed)) {
+      return '找不到 Pi CLI。请检查 Pi 设置里的 CLI 路径，或确认系统 PATH 中可直接运行 `pi`。';
+    }
+    if (/unexpected argument|unexpected option|Usage:\s*pi/i.test(raw || '')) {
+      return `Pi CLI 参数不兼容：${firstMeaningfulLine(condensed)}。建议检查当前 Pi 版本与 cc-web 的参数约定是否匹配。`;
+    }
+    if (/permission denied|EACCES|EPERM/i.test(condensed)) {
+      return 'Pi CLI 启动失败：当前环境没有足够权限执行该命令或访问目标目录。';
+    }
+    if (/authentication|unauthorized|forbidden|login|api key|credential/i.test(condensed)) {
+      return 'Pi 鉴权失败。请确认本机 Pi CLI 已完成登录或 API Key 配置仍然有效。';
+    }
+    if (/rate limit|quota|billing|credits/i.test(condensed)) {
+      return 'Pi 请求被额度或速率限制拦截。请检查账号配额、计费状态或稍后重试。';
+    }
+    if (/network|timed out|timeout|ECONNRESET|ENOTFOUND|TLS|certificate|fetch failed/i.test(condensed)) {
+      return 'Pi 运行时网络请求失败。请检查当前网络、代理或证书环境后重试。';
+    }
+    return `Pi 任务失败${exitInfo}：${condensed}`;
+  }
+
   if (/ENOENT|not found|No such file/i.test(condensed)) {
     return '找不到 Claude CLI。请检查当前环境是否能直接运行 `claude`。';
   }
@@ -1482,21 +1555,20 @@ function formatRuntimeError(agent, raw, context = {}) {
 }
 
 function compactStartMessage(agent) {
-  return agent === 'codex'
-    ? '正在执行 Codex /compact 压缩上下文，请稍候…'
-    : '正在执行 Claude 原生 /compact 压缩上下文，请稍候…';
+  if (agent === 'codex') return '正在执行 Codex /compact 压缩上下文，请稍候…';
+  if (agent === 'pi') return '正在执行 Pi /compact 压缩上下文，请稍候…';
+  return '正在执行 Claude 原生 /compact 压缩上下文，请稍候…';
 }
 
 function compactDoneMessage(agent) {
-  return agent === 'codex'
-    ? '上下文压缩完成。已执行 Codex /compact，下次继续在同一会话发送即可。'
-    : '上下文压缩完成。已按 Claude Code 原生策略执行 /compact，下次继续在同一会话发送即可。';
+  if (agent === 'codex') return '上下文压缩完成。已执行 Codex /compact，下次继续在同一会话发送即可。';
+  if (agent === 'pi') return '上下文压缩完成。已执行 Pi /compact，下次继续在同一会话发送即可。';
+  return '上下文压缩完成。已按 Claude Code 原生策略执行 /compact，下次继续在同一会话发送即可。';
 }
 
 function initStartMessage(agent) {
-  return agent === 'codex'
-    ? '正在分析项目并生成 AGENTS.md ...'
-    : '正在分析项目并生成 CLAUDE.md ...';
+  if (agent === 'codex' || agent === 'pi') return '正在分析项目并生成 AGENTS.md ...';
+  return '正在分析项目并生成 CLAUDE.md ...';
 }
 
 function buildCodexInitPrompt(cwd) {
@@ -1515,16 +1587,32 @@ function buildCodexInitPrompt(cwd) {
   ].join('\n');
 }
 
+function buildPiInitPrompt(cwd) {
+  const targetPath = path.join(cwd || process.cwd(), 'AGENTS.md');
+  return [
+    'You are running cc-web\'s /init for a Pi session.',
+    'Analyze the current workspace and create or update AGENTS.md at the repository root.',
+    `The file path to write is: ${targetPath}`,
+    'Requirements:',
+    '- Actually write the file; do not stop after summarizing in chat.',
+    '- If AGENTS.md already exists, update it in place instead of creating a duplicate.',
+    '- Keep the document concise and practical for future coding agents working in this repo.',
+    '- Include the project purpose, key entry points, dev/test commands, important workflows, and repo-specific safety constraints.',
+    '- Prefer facts from the actual codebase over README claims when they differ.',
+    '- After editing the file, reply with a brief summary of what you wrote.',
+  ].join('\n');
+}
+
 function compactAutoStartMessage(agent) {
-  return agent === 'codex'
-    ? '检测到上下文达到上限，正在按 Codex /compact 自动压缩，然后继续当前任务…'
-    : '检测到上下文达到上限，正在按 Claude Code 原版策略自动执行 /compact，然后继续当前任务…';
+  if (agent === 'codex') return '检测到上下文达到上限，正在按 Codex /compact 自动压缩，然后继续当前任务…';
+  if (agent === 'pi') return '检测到上下文达到上限，正在按 Pi /compact 自动压缩，然后继续当前任务…';
+  return '检测到上下文达到上限，正在按 Claude Code 原版策略自动执行 /compact，然后继续当前任务…';
 }
 
 function compactAutoResumeMessage(agent) {
-  return agent === 'codex'
-    ? '检测到上一条请求因上下文过大失败，现已按 Codex 压缩计划继续执行。'
-    : '检测到上一条请求因上下文过大失败，现已自动按压缩计划继续执行。';
+  if (agent === 'codex') return '检测到上一条请求因上下文过大失败，现已按 Codex 压缩计划继续执行。';
+  if (agent === 'pi') return '检测到上一条请求因上下文过大失败，现已按 Pi 压缩计划继续执行。';
+  return '检测到上一条请求因上下文过大失败，现已自动按压缩计划继续执行。';
 }
 
 function isContextLimitError(agent, raw) {
@@ -2060,6 +2148,12 @@ wss.on('connection', (ws, req) => {
       case 'import_codex_session':
         handleImportCodexSession(ws, msg);
         break;
+      case 'list_pi_sessions':
+        handleListPiSessions(ws);
+        break;
+      case 'import_pi_session':
+        handleImportPiSession(ws, msg);
+        break;
       case 'list_cwd_suggestions':
         handleListCwdSuggestions(ws);
         break;
@@ -2225,7 +2319,7 @@ function handleSaveModelConfig(ws, newConfig) {
       const sessionId = file.slice(0, -5);
       try {
         const session = loadSession(sessionId);
-        if (!session?.model || session.agent === 'codex') continue;
+        if (!session?.model || getSessionAgent(session) !== 'claude') continue;
         const tier = modelToTier.get(session.model);
         if (tier && MODEL_MAP[tier] !== session.model) {
           session.model = MODEL_MAP[tier];
@@ -2484,10 +2578,11 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
 
     case '/model': {
       const modelInput = parts[1];
-      if (agent === 'codex') {
+      if (agent === 'codex' || agent === 'pi') {
+        const label = agent === 'pi' ? 'Pi' : 'Codex';
         if (!modelInput) {
-          const current = session?.model || resolveDefaultCodexModel() || '配置默认模型';
-          wsSend(ws, { type: 'system_message', message: `当前 Codex 模型: ${current}\n用法: /model <模型名>` });
+          const current = session?.model || (agent === 'pi' ? resolveDefaultPiModel() : resolveDefaultCodexModel()) || '配置默认模型';
+          wsSend(ws, { type: 'system_message', message: `当前 ${label} 模型: ${current}\n用法: /model <模型名>` });
         } else {
           if (session) {
             session.model = modelInput;
@@ -2495,7 +2590,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
             saveSession(session);
           }
           wsSend(ws, { type: 'model_changed', model: modelInput });
-          wsSend(ws, { type: 'system_message', message: `Codex 模型已切换为: ${modelInput}` });
+          wsSend(ws, { type: 'system_message', message: `${label} 模型已切换为: ${modelInput}` });
         }
       } else if (!modelInput) {
         const current = session?.model ? modelShortName(session.model) || session.model : 'opus (默认)';
@@ -2519,11 +2614,13 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
     }
 
     case '/cost': {
-      if (agent === 'codex') {
+      if (agent === 'codex' || agent === 'pi') {
         const usage = session?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+        const cost = session?.totalCost || 0;
+        const costSuffix = cost > 0 ? `，费用 $${cost.toFixed(4)}` : '';
         wsSend(ws, {
           type: 'system_message',
-          message: `当前会话累计 Token: 输入 ${usage.inputTokens}，缓存 ${usage.cachedInputTokens}，输出 ${usage.outputTokens}`,
+          message: `当前会话累计 Token: 输入 ${usage.inputTokens}，缓存 ${usage.cachedInputTokens}，输出 ${usage.outputTokens}${costSuffix}`,
         });
       } else {
         const cost = session?.totalCost || 0;
@@ -2547,7 +2644,9 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
           type: 'system_message',
           message: agent === 'codex'
             ? '当前会话尚未建立 Codex 上下文，暂时无需压缩。'
-            : '当前会话尚未建立 Claude 上下文，暂时无需压缩。',
+            : agent === 'pi'
+              ? '当前会话尚未建立 Pi 上下文，暂时无需压缩。'
+              : '当前会话尚未建立 Claude 上下文，暂时无需压缩。',
         });
         break;
       }
@@ -2569,8 +2668,13 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
       }
       wsSend(ws, { type: 'system_message', message: initStartMessage(agent) });
       pendingSlashCommands.set(session.id, { kind: 'init' });
+      const initText = agent === 'codex'
+        ? buildCodexInitPrompt(session.cwd)
+        : agent === 'pi'
+          ? buildPiInitPrompt(session.cwd)
+          : '/init';
       handleMessage(ws, {
-        text: agent === 'codex' ? buildCodexInitPrompt(session.cwd) : '/init',
+        text: initText,
         sessionId: session.id,
         mode: session.permissionMode || 'yolo',
       }, { hideInHistory: true });
@@ -2650,7 +2754,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
 		        const mode = modeInput.toLowerCase();
 		        if (session) {
 		          session.permissionMode = mode;
-		          // Mode switching should not reset runtime context (Claude/Codex both resume).
+          // Mode switching should not reset runtime context (Claude/Codex/Pi all resume).
 		          session.updated = new Date().toISOString();
 		          saveSession(session);
 		        }
@@ -2674,7 +2778,9 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
         type: 'system_message',
         message: agent === 'codex'
           ? base + '\n/model [名称] — 查看/切换 Codex 模型（自由输入）\n/compact — 执行 Codex /compact 压缩上下文\n/init — 分析项目并生成/更新 AGENTS.md'
-          : base + '\n/model [名称] — 查看/切换模型（opus, sonnet, haiku）\n/compact — 执行 Claude 原生上下文压缩（保留压缩计划并可自动续跑）\n/init — 分析项目并生成/更新 CLAUDE.md',
+          : agent === 'pi'
+            ? base + '\n/model [名称] — 查看/切换 Pi 模型（支持 provider/model:thinking）\n/compact — 执行 Pi /compact 压缩上下文\n/init — 分析项目并生成/更新 AGENTS.md'
+            : base + '\n/model [名称] — 查看/切换模型（opus, sonnet, haiku）\n/compact — 执行 Claude 原生上下文压缩（保留压缩计划并可自动续跑）\n/init — 分析项目并生成/更新 CLAUDE.md',
       });
       break;
     }
@@ -2716,7 +2822,10 @@ function handleNewSession(ws, msg) {
     agent,
     claudeSessionId: null,
     codexThreadId: null,
-    model: agent === 'codex' ? resolveDefaultCodexModel() : MODEL_MAP.opus,
+    piSessionId: null,
+    piSessionFile: '',
+    piSessionDir: agent === 'pi' ? piSessionDir(id) : '',
+    model: agent === 'codex' ? resolveDefaultCodexModel() : agent === 'pi' ? resolveDefaultPiModel() : MODEL_MAP.opus,
     permissionMode: requestedMode,
     totalCost: 0,
     totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
@@ -2920,6 +3029,25 @@ function deleteCodexLocalSession(session) {
   return { removedFiles, removedDbRows };
 }
 
+function deletePiLocalSession(session) {
+  const sessionFile = session?.piSessionFile ? path.resolve(session.piSessionFile) : '';
+  const sessionDir = session?.piSessionDir ? path.resolve(session.piSessionDir) : '';
+  const webRoot = path.resolve(PI_WEB_SESSIONS_DIR);
+  let removedFiles = 0;
+  try {
+    if (sessionFile && isPathInside(sessionFile, webRoot) && fs.existsSync(sessionFile)) {
+      fs.unlinkSync(sessionFile);
+      removedFiles++;
+    }
+  } catch {}
+  try {
+    if (sessionDir && isPathInside(sessionDir, webRoot) && fs.existsSync(sessionDir)) {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+  } catch {}
+  return { removedFiles };
+}
+
 function handleDeleteSession(ws, sessionId) {
   pendingSlashCommands.delete(sessionId);
   pendingCompactRetries.delete(sessionId);
@@ -2947,6 +3075,13 @@ function handleDeleteSession(ws, sessionId) {
         removedFiles: result.removedFiles,
         removedDbRows: result.removedDbRows,
       });
+    } else if (sessionAgent === 'pi') {
+      const result = deletePiLocalSession(session);
+      plog('INFO', 'pi_local_session_deleted', {
+        sessionId: sessionId.slice(0, 8),
+        piSessionId: session?.piSessionId || null,
+        removedFiles: result.removedFiles,
+      });
     } else {
       deleteClaudeLocalSession(session?.claudeSessionId || null);
     }
@@ -2968,20 +3103,20 @@ function handleRenameSession(ws, sessionId, title) {
   }
 }
 
-		function handleSetMode(ws, sessionId, mode) {
-		  const VALID_MODES = ['default', 'plan', 'yolo'];
-		  if (!mode || !VALID_MODES.includes(mode)) return;
-		  if (sessionId) {
-		    const session = loadSession(sessionId);
-		    if (session) {
-		      session.permissionMode = mode;
-		      // Same rule as /mode: don't clear runtime context on mode changes.
-		      session.updated = new Date().toISOString();
-		      saveSession(session);
-		    }
-		  }
-		  wsSend(ws, { type: 'mode_changed', mode });
-		}
+function handleSetMode(ws, sessionId, mode) {
+  const VALID_MODES = ['default', 'plan', 'yolo'];
+  if (!mode || !VALID_MODES.includes(mode)) return;
+  if (sessionId) {
+    const session = loadSession(sessionId);
+    if (session) {
+      session.permissionMode = mode;
+      // Same rule as /mode: don't clear runtime context on mode changes.
+      session.updated = new Date().toISOString();
+      saveSession(session);
+    }
+  }
+  wsSend(ws, { type: 'mode_changed', mode });
+}
 
 function handleDisconnect(ws, wsId) {
   const affectedSessions = [];
@@ -3066,7 +3201,10 @@ function handleMessage(ws, msg, options = {}) {
 	      agent,
 	      claudeSessionId: null,
 	      codexThreadId: null,
-	      model: agent === 'codex' ? resolveDefaultCodexModel() : null,
+        piSessionId: null,
+        piSessionFile: '',
+        piSessionDir: agent === 'pi' ? piSessionDir(id) : '',
+	      model: agent === 'codex' ? resolveDefaultCodexModel() : agent === 'pi' ? resolveDefaultPiModel() : null,
 	      permissionMode: mode || 'yolo',
 	      totalCost: 0,
 	      totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
@@ -3135,7 +3273,9 @@ function handleMessage(ws, msg, options = {}) {
 
   const spawnSpec = isClaudeSession(session)
     ? buildClaudeSpawnSpec(session, { attachments: resolvedAttachments })
-    : buildCodexSpawnSpec(session, { attachments: resolvedAttachments });
+    : isCodexSession(session)
+      ? buildCodexSpawnSpec(session, { attachments: resolvedAttachments })
+      : buildPiSpawnSpec(session, { attachments: resolvedAttachments });
   if (spawnSpec?.error) {
     return wsSend(ws, { type: 'error', message: spawnSpec.error });
   }
@@ -3194,6 +3334,8 @@ function handleMessage(ws, msg, options = {}) {
     errorSent: false,
     codexHomeDir: spawnSpec.codexHomeDir || '',
     codexRuntimeKey: spawnSpec.codexRuntimeKey || '',
+    piSessionDir: spawnSpec.piSessionDir || '',
+    piSessionFile: spawnSpec.piSessionFile || '',
     tailer: null,
     spawnFailed: false,
   };
@@ -3335,18 +3477,22 @@ function sanitizeToolInput(toolName, input) {
 const {
   buildClaudeSpawnSpec,
   buildCodexSpawnSpec,
+  buildPiSpawnSpec,
   processClaudeEvent,
   processCodexEvent,
+  processPiEvent,
   processRuntimeEvent,
 } = createAgentRuntime({
   processEnv: process.env,
   CLAUDE_PATH,
   CODEX_PATH,
+  PI_PATH,
   MODEL_MAP,
   loadModelConfig,
   applyCustomTemplateToSettings,
   loadCodexConfig,
   prepareCodexCustomRuntime,
+  piSessionDir,
   wsSend,
   truncateObj,
   sanitizeToolInput,
@@ -3414,6 +3560,15 @@ const CLAUDE_PROJECTS_DIR = path.join(process.env.HOME || process.env.USERPROFIL
 const CODEX_SESSIONS_DIR = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'sessions');
 const CODEX_STATE_DB_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'state_5.sqlite');
 const CODEX_LOG_DB_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'logs_1.sqlite');
+const PI_SESSIONS_DIR = path.join(process.env.HOME || process.env.USERPROFILE || '', '.pi', 'agent', 'sessions');
+
+function isPathInside(childPath, parentPath) {
+  if (!childPath || !parentPath) return false;
+  const parent = path.resolve(parentPath);
+  const child = path.resolve(childPath);
+  const rel = path.relative(parent, child);
+  return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel));
+}
 
 function resolveClaudeSessionLocalMeta(claudeSessionId) {
   if (!claudeSessionId) return null;
@@ -3497,6 +3652,17 @@ const {
   parseCodexRolloutFile,
 } = createCodexRolloutStore({
   codexSessionsDir: CODEX_SESSIONS_DIR,
+  sessionsDir: SESSIONS_DIR,
+  normalizeSession,
+  sanitizeToolInput,
+});
+
+const {
+  getPiSessionFiles,
+  getImportedPiSessionIds,
+  parsePiSessionFile,
+} = createPiSessionStore({
+  piSessionsDir: PI_SESSIONS_DIR,
   sessionsDir: SESSIONS_DIR,
   normalizeSession,
   sanitizeToolInput,
@@ -3735,6 +3901,120 @@ function handleImportCodexSession(ws, msg) {
     totalUsage: parsed.totalUsage || existingSession?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
     messages: parsed.messages,
     cwd: parsed.meta.cwd || existingSession?.cwd || null,
+  };
+
+  saveSession(session);
+  wsSessionMap.set(ws, id);
+  wsSend(ws, {
+    type: 'session_info',
+    sessionId: id,
+    messages: session.messages,
+    title: session.title,
+    mode: session.permissionMode,
+    model: sessionModelLabel(session),
+    agent: getSessionAgent(session),
+    cwd: session.cwd,
+    totalCost: session.totalCost || 0,
+    totalUsage: session.totalUsage || null,
+    updated: session.updated,
+    hasUnread: false,
+    historyPending: false,
+    isRunning: false,
+    taskMode: session.taskMode || 'local',
+    sshHostId: session.sshHostId || '',
+    remoteCwd: session.remoteCwd || '',
+  });
+  sendSessionList(ws);
+}
+
+function handleListPiSessions(ws) {
+  const imported = getImportedPiSessionIds();
+  const items = [];
+  const seen = new Set();
+  for (const filePath of getPiSessionFiles()) {
+    const parsed = parsePiSessionFile(filePath);
+    const sessionId = parsed?.meta?.sessionId;
+    if (!sessionId || seen.has(sessionId)) continue;
+    seen.add(sessionId);
+    const title = parsed.meta.title || sessionId.slice(0, 20);
+    items.push({
+      sessionId,
+      title,
+      cwd: parsed.meta.cwd || null,
+      updatedAt: parsed.meta.updatedAt || null,
+      model: parsed.meta.model || '',
+      source: parsed.meta.source || 'pi',
+      sessionPath: filePath,
+      alreadyImported: imported.has(sessionId),
+    });
+  }
+  items.sort((a, b) => {
+    const at = Date.parse(a.updatedAt || '') || 0;
+    const bt = Date.parse(b.updatedAt || '') || 0;
+    return bt - at || (b.sessionId || '').localeCompare(a.sessionId || '');
+  });
+  wsSend(ws, { type: 'pi_sessions', sessions: items });
+}
+
+function handleImportPiSession(ws, msg) {
+  const sessionId = String(msg?.sessionId || '').trim();
+  if (!sessionId) {
+    return wsSend(ws, { type: 'error', message: '缺少 sessionId' });
+  }
+
+  let parsed = null;
+  const requestedPath = msg?.sessionPath ? path.resolve(String(msg.sessionPath)) : '';
+  if (requestedPath && isPathInside(requestedPath, PI_SESSIONS_DIR) && fs.existsSync(requestedPath)) {
+    parsed = parsePiSessionFile(requestedPath);
+  }
+  if (!parsed) {
+    for (const filePath of getPiSessionFiles()) {
+      const candidate = parsePiSessionFile(filePath);
+      if (candidate?.meta?.sessionId === sessionId) {
+        parsed = candidate;
+        break;
+      }
+    }
+  }
+
+  if (!parsed || parsed.meta.sessionId !== sessionId) {
+    return wsSend(ws, { type: 'error', message: '未找到对应的 Pi 会话文件' });
+  }
+
+  let existingSession = null;
+  try {
+    for (const f of fs.readdirSync(SESSIONS_DIR).filter((name) => name.endsWith('.json'))) {
+      try {
+        const s = normalizeSession(JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8')));
+        if (s.piSessionId === sessionId) { existingSession = s; break; }
+      } catch {}
+    }
+  } catch {}
+
+  const id = existingSession ? existingSession.id : crypto.randomUUID();
+  const sessionDir = existingSession?.piSessionDir || piSessionDir(id);
+  const session = {
+    id,
+    title: parsed.meta.title || existingSession?.title || sessionId.slice(0, 20),
+    created: existingSession?.created || new Date().toISOString(),
+    updated: new Date().toISOString(),
+    agent: 'pi',
+    claudeSessionId: null,
+    codexThreadId: null,
+    piSessionId: sessionId,
+    piSessionFile: parsed.filePath,
+    piSessionDir: sessionDir,
+    importedFrom: 'pi',
+    importedPiSessionPath: parsed.filePath,
+    model: existingSession?.model || parsed.meta.model || resolveDefaultPiModel() || '',
+    permissionMode: existingSession?.permissionMode || 'yolo',
+    totalCost: existingSession?.totalCost || parsed.totalUsage?.cost || 0,
+    totalUsage: parsed.totalUsage || existingSession?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+    messages: parsed.messages,
+    cwd: parsed.meta.cwd || existingSession?.cwd || null,
+    taskMode: existingSession?.taskMode || 'local',
+    sshHostId: existingSession?.sshHostId || '',
+    remoteCwd: existingSession?.remoteCwd || '',
   };
 
   saveSession(session);

@@ -26,6 +26,7 @@
   const AGENT_LABELS = {
     claude: 'Claude',
     codex: 'Codex',
+    pi: 'Pi',
   };
 
   const DEFAULT_AGENT = 'claude';
@@ -1089,7 +1090,13 @@
       });
     }
     if (importSessionBtn) {
-      importSessionBtn.textContent = currentAgent === 'codex' ? '导入本地 Codex 会话' : '导入本地 Claude 会话';
+      if (currentAgent === 'codex') {
+        importSessionBtn.textContent = '导入本地 Codex 会话';
+      } else if (currentAgent === 'pi') {
+        importSessionBtn.textContent = '导入本地 Pi 会话';
+      } else {
+        importSessionBtn.textContent = '导入本地 Claude 会话';
+      }
     }
   }
 
@@ -1296,7 +1303,7 @@
   }
 
   function setStatsDisplay(msg) {
-    if (currentAgent === 'codex' && msg && msg.totalUsage) {
+    if ((currentAgent === 'codex' || currentAgent === 'pi') && msg && msg.totalUsage) {
       const usage = msg.totalUsage;
       if ((usage.inputTokens || 0) > 0 || (usage.outputTokens || 0) > 0) {
         const cacheText = usage.cachedInputTokens ? ` · cache ${usage.cachedInputTokens}` : '';
@@ -1779,6 +1786,10 @@
         if (typeof _onCodexSessions === 'function') _onCodexSessions(msg.sessions || []);
         break;
 
+      case 'pi_sessions':
+        if (typeof _onPiSessions === 'function') _onPiSessions(msg.sessions || []);
+        break;
+
       case 'cwd_suggestions':
         if (typeof _onCwdSuggestions === 'function') _onCwdSuggestions(msg.paths || []);
         break;
@@ -1910,6 +1921,8 @@
     avatar.className = 'msg-avatar';
     if (role === 'user') {
       avatar.textContent = 'U';
+    } else if (currentAgent === 'pi') {
+      avatar.textContent = 'Pi';
     } else if (currentAgent === 'codex') {
       avatar.innerHTML = `<img src="/codex.png" width="24" height="24" style="display:block;" alt="Codex">`;
     } else {
@@ -2461,6 +2474,9 @@
     if (normalized === 'codex') {
       return '删除本会话将同步删去本地 Codex rollout 历史与线程记录，不可恢复。确认删除？';
     }
+    if (normalized === 'pi') {
+      return '删除本会话将同步删去 cc-web 管理的 Pi 会话文件；导入的原生历史不会被删除。确认删除？';
+    }
     return '删除本会话将同步删去本地 Claude 中的会话历史，不可恢复。确认删除？';
   }
 
@@ -2928,14 +2944,14 @@
     const chatMain = document.querySelector('.chat-main');
     chatMain.appendChild(picker);
 
-	    picker.querySelectorAll('.option-picker-item').forEach(el => {
-	      el.addEventListener('click', () => {
-	        // Close current picker first so onSelect can safely open a nested picker.
-	        const v = el.dataset.value;
-	        hideOptionPicker();
-	        onSelect(v);
-	      });
-	    });
+    picker.querySelectorAll('.option-picker-item').forEach(el => {
+      el.addEventListener('click', () => {
+        // Close current picker first so onSelect can safely open a nested picker.
+        const v = el.dataset.value;
+        hideOptionPicker();
+        onSelect(v);
+      });
+    });
 
     // Close on outside click (delayed to avoid immediate close)
     setTimeout(() => {
@@ -2964,25 +2980,32 @@
     }
   }
 
-	  function showModelPicker() {
-	    if (currentAgent === 'codex') {
-	      const current = _splitCodexThinkingModel(currentModel || '');
-	      const baseOptions = getCodexBaseModelOptions();
-	      if (baseOptions.length === 0) {
-	        appendSystemMessage('当前 Codex Profile 未配置 /model 候选列表。请先在设置 -> Codex API 配置中填写模型列表，或直接输入 /model <模型名>。');
-	        return;
-	      }
-	      showOptionPicker('选择 Codex 模型', baseOptions, current.base || '', (baseValue) => {
-	        const base = String(baseValue || '').trim();
-	        showOptionPicker('选择 Thinking 强度', CODEX_REASONING_OPTIONS, current.level || '', (lvl) => {
-	          const full = _joinCodexThinkingModel(base, lvl);
-	          send({ type: 'message', text: `/model ${full}`, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
-	        });
-	      });
-	      return;
-	    }
-	    showOptionPicker('选择模型', MODEL_OPTIONS, currentModel, (value) => {
-	      send({ type: 'message', text: `/model ${value}`, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+  function showModelPicker() {
+    if (currentAgent === 'codex') {
+      const current = _splitCodexThinkingModel(currentModel || '');
+      const baseOptions = getCodexBaseModelOptions();
+      if (baseOptions.length === 0) {
+        appendSystemMessage('当前 Codex Profile 未配置 /model 候选列表。请先在设置 -> Codex API 配置中填写模型列表，或直接输入 /model <模型名>。');
+        return;
+      }
+      showOptionPicker('选择 Codex 模型', baseOptions, current.base || '', (baseValue) => {
+        const base = String(baseValue || '').trim();
+        showOptionPicker('选择 Thinking 强度', CODEX_REASONING_OPTIONS, current.level || '', (lvl) => {
+          const full = _joinCodexThinkingModel(base, lvl);
+          send({ type: 'message', text: `/model ${full}`, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+        });
+      });
+      return;
+    }
+    if (currentAgent === 'pi') {
+      const model = prompt('输入 Pi 模型（例如 provider/model:thinking）:', currentModel || '');
+      if (model && model.trim()) {
+        send({ type: 'message', text: `/model ${model.trim()}`, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+      }
+      return;
+    }
+    showOptionPicker('选择模型', MODEL_OPTIONS, currentModel, (value) => {
+      send({ type: 'message', text: `/model ${value}`, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
     });
   }
 
@@ -3109,6 +3132,8 @@
     newChatDropdown.hidden = true;
     if (currentAgent === 'codex') {
       showImportCodexSessionModal();
+    } else if (currentAgent === 'pi') {
+      showImportPiSessionModal();
     } else {
       showImportSessionModal();
     }
@@ -3266,6 +3291,7 @@
   let _onCodexConfig = null;
   let _onFetchModelsResult = null;
   let _onCodexSessions = null;
+  let _onPiSessions = null;
   let _onClaudeLocalConfig = null;
   let _onCodexLocalConfig = null;
   let _onDevConfig = null;
@@ -4980,6 +5006,91 @@
     };
 
     send({ type: 'list_codex_sessions' });
+  }
+
+  function showImportPiSessionModal() {
+    if (currentAgent !== 'pi') return;
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'import-pi-session-overlay';
+
+    overlay.innerHTML = `
+      <div class="modal-panel modal-panel-wide">
+        <div class="modal-header">
+          <span class="modal-title">导入本地 Pi 会话</span>
+          <button class="modal-close-btn" id="ips-close-btn">✕</button>
+        </div>
+        <div class="modal-body" id="ips-body">
+          ${buildAgentContextCard('pi', '从 Pi 原生历史导入', '读取 ~/.pi/agent/sessions/ 下的 JSONL 会话文件，恢复用户消息、助手输出、工具调用和 token 统计。')}
+          <div class="modal-loading">正在加载 Pi 本地历史…</div>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(overlay);
+
+    function close() {
+      overlay.remove();
+      _onPiSessions = null;
+    }
+
+    overlay.querySelector('#ips-close-btn').addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+    _onPiSessions = (items) => {
+      const body = overlay.querySelector('#ips-body');
+      if (!body) return;
+      if (!items || items.length === 0) {
+        body.innerHTML = `${buildAgentContextCard('pi', '从 Pi 原生历史导入', '读取 ~/.pi/agent/sessions/ 下的 JSONL 会话文件，恢复用户消息、助手输出、工具调用和 token 统计。')}<div class="modal-empty">未找到本地 Pi 会话</div>`;
+        return;
+      }
+
+      body.innerHTML = buildAgentContextCard('pi', '从 Pi 原生历史导入', '读取 ~/.pi/agent/sessions/ 下的 JSONL 会话文件，恢复用户消息、助手输出、工具调用和 token 统计。');
+      for (const group of groupCodexSessionsByProject(items)) {
+        const { groupEl, contentEl } = createCollapsibleImportGroup(group.dir);
+
+        group.sessions.forEach((sess) => {
+          const item = document.createElement('div');
+          item.className = 'import-item';
+
+          const info = document.createElement('div');
+          info.className = 'import-item-info';
+
+          const titleEl = document.createElement('div');
+          titleEl.className = 'import-item-title';
+          titleEl.textContent = sess.title || sess.sessionId;
+
+          const meta = document.createElement('div');
+          meta.className = 'import-item-meta';
+          const cwdText = sess.cwd || group.dir || '';
+          const timeText = sess.updatedAt ? timeAgo(sess.updatedAt) : '';
+          const modelText = sess.model ? `model ${sess.model}` : '';
+          meta.textContent = [cwdText, timeText, modelText].filter(Boolean).join(' · ');
+
+          info.appendChild(titleEl);
+          info.appendChild(meta);
+
+          const btn = document.createElement('button');
+          btn.className = 'import-item-btn';
+          btn.textContent = sess.alreadyImported ? '重新导入' : '导入';
+          btn.addEventListener('click', () => {
+            const confirmed = sess.alreadyImported
+              ? confirm('已导入过此 Pi 会话，重新导入将覆盖已有内容。确认继续？')
+              : confirm('将解析本地 Pi 原生历史并导入当前 Web 视图。确认继续？');
+            if (!confirmed) return;
+            close();
+            send({ type: 'import_pi_session', sessionId: sess.sessionId, sessionPath: sess.sessionPath });
+          });
+
+          item.appendChild(info);
+          item.appendChild(btn);
+          contentEl.appendChild(item);
+        });
+        body.appendChild(groupEl);
+      }
+    };
+
+    send({ type: 'list_pi_sessions' });
   }
 
   // --- Helpers ---

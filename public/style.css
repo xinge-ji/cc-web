@@ -1026,6 +1026,13 @@ body.session-loading-active {
   background: transparent;
   border: none;
 }
+.msg.assistant.agent-pi .msg-avatar {
+  background: var(--accent-light);
+  border: 1px solid rgba(192, 85, 58, 0.16);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 800;
+}
 
 .msg-bubble {
   padding: 12px 16px;

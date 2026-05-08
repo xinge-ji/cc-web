@@ -1,6 +1,6 @@
 # CC-Web
 
-A lightweight browser interface for Claude Code and Codex, designed to keep each agent close to its native CLI workflow while sharing the same web shell.
+A lightweight browser interface for Claude Code, Codex, and Pi, designed to keep each agent close to its native CLI workflow while sharing the same web shell.
 
 ![Node.js](https://img.shields.io/badge/Node.js-22+-339933?logo=node.js&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue)
@@ -16,13 +16,13 @@ A lightweight browser interface for Claude Code and Codex, designed to keep each
 ## Features
 
 - **Lightweight runtime**: low backend overhead, browser-based control panel.
-- **Dual-agent sessions**: create Claude or Codex sessions on the same backend core.
-- **Agent-isolated views**: switching Claude / Codex only shows that agent's sessions, recent state, settings, and import entry points.
+- **Multi-agent sessions**: create Claude, Codex, or Pi sessions on the same backend core.
+- **Agent-isolated views**: switching Claude / Codex / Pi only shows that agent's sessions, recent state, settings, and import entry points.
 - **Agent-specific settings**: Claude keeps template-based model config; Codex has its own path, default model, mode, and search settings.
 - **Multi-session management**: create, switch, rename, and delete sessions; deleting a session also removes the local Claude history record.
-- **Local history import**: import Claude history from `~/.claude/projects/` and Codex rollout history from `~/.codex/sessions/`.
+- **Local history import**: import Claude history from `~/.claude/projects/`, Codex rollout history from `~/.codex/sessions/`, and Pi JSONL history from `~/.pi/agent/sessions/`.
 - **Session resume**: context continuity via `--resume`; you can also reattach via SSH + `tmux attach -t claude` when needed.
-- **Background task support**: Claude processes continue after browser disconnect and notify you on completion.
+- **Background task support**: local agent processes continue after browser disconnect and notify you on completion.
 - **Multi-channel notifications**: PushPlus / Telegram / ServerChan / Feishu bot / QQ (Qmsg), configurable in Web UI.
 - **Process persistence**: detached subprocess + PID files; running tasks survive service restarts.
 - **Multi-API switching**: configure multiple API profiles and switch between them instantly from the UI.
@@ -32,7 +32,7 @@ A lightweight browser interface for Claude Code and Codex, designed to keep each
 ## Requirements
 
 - **Node.js** >= 18
-- **Claude Code CLI** and/or **Codex CLI** installed and configured
+- **Claude Code CLI**, **Codex CLI**, and/or **Pi CLI** installed and configured
 
 ```bash
 npm install -g @anthropic-ai/claude-code
@@ -74,6 +74,7 @@ After startup, open `http://localhost:8002` and sign in with your password.
 | `PORT` | No | `8002` | Service port |
 | `CLAUDE_PATH` | No | `claude` | Executable path to Claude CLI |
 | `CODEX_PATH` | No | `codex` | Executable path to Codex CLI |
+| `PI_PATH` | No | `pi` | Executable path to Pi CLI |
 | `PUSHPLUS_TOKEN` | No | - | PushPlus token (migrated into notification config on first start) |
 
 ### Notification Configuration
@@ -106,8 +107,9 @@ Passwords are stored in `config/auth.json` and support generation + UI updates:
 cc-web/
 ├── server.js              # Node.js backend (HTTP + WebSocket + process management + notifications)
 ├── lib/
-│   ├── agent-runtime.js    # Claude / Codex runtime adapter
-│   └── codex-rollouts.js   # Codex rollout history parser
+│   ├── agent-runtime.js    # Claude / Codex / Pi runtime adapter
+│   ├── codex-rollouts.js   # Codex rollout history parser
+│   └── pi-sessions.js      # Pi JSONL history parser
 ├── public/
 │   ├── index.html          # UI structure
 │   ├── app.js              # Frontend logic (WebSocket, UI interactions)
@@ -119,7 +121,7 @@ cc-web/
 │   └── auth.json           # Auth config (generated at runtime)
 ├── sessions/               # Chat history JSON files (generated at runtime)
 ├── logs/                   # Process lifecycle logs (generated at runtime)
-├── lib/                    # Agent runtime + Codex rollout parsing helpers
+├── lib/                    # Agent runtime + Codex/Pi history parsing helpers
 ├── scripts/                # Regression tooling + mock CLIs
 ├── .env.example            # Environment variable template
 ├── start.bat               # Windows startup script
@@ -133,10 +135,10 @@ cc-web/
 ### Process Model
 
 ```text
-Browser ←WebSocket→ Node.js (server.js) ←file I/O→ Claude / Codex CLI (detached)
+Browser ←WebSocket→ Node.js (server.js) ←file I/O→ Claude / Codex / Pi CLI (detached)
 ```
 
-- Each user message spawns either a Claude or Codex subprocess depending on the session agent.
+- Each user message spawns a Claude, Codex, or Pi subprocess depending on the session agent.
 - Subprocesses use `detached: true` + `proc.unref()` and run independently from Node.js lifecycle.
 - stdin/stdout/stderr are bridged via files in `sessions/{id}-run/`.
 - PID is persisted to disk and recovered after service restart (`recoverProcesses()`).
@@ -144,7 +146,7 @@ Browser ←WebSocket→ Node.js (server.js) ←file I/O→ Claude / Codex CLI (d
 
 ### Background Task Flow
 
-1. User sends a message → spawn Claude subprocess.
+1. User sends a message → spawn the current session's agent subprocess.
 2. User closes browser → subprocess keeps running.
 3. Process completes → PID monitor detects exit.
 4. Completion notification is sent.
@@ -210,6 +212,7 @@ WorkingDirectory=/mnt/c/Project/cc-web
 Environment=HOME=/root
 Environment=PATH=/root/.nvm/versions/node/v20.19.4/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=CODEX_PATH=/root/.nvm/versions/node/v20.19.4/bin/codex
+Environment=PI_PATH=/root/.nvm/versions/node/v20.19.4/bin/pi
 ExecStart=/root/.nvm/versions/node/v20.19.4/bin/node /mnt/c/Project/cc-web/server.js
 Restart=on-failure
 RestartSec=5
@@ -253,7 +256,7 @@ server {
 
 ### Windows Deployment
 
-Use this mode when running CC-Web on a personal PC and controlling Claude / Codex from mobile.
+Use this mode when running CC-Web on a personal PC and controlling Claude / Codex / Pi from mobile.
 
 Start with `start.bat`, or run manually:
 

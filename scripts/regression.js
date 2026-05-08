@@ -11,6 +11,7 @@ const REPO_DIR = path.resolve(__dirname, '..');
 const SERVER_PATH = path.join(REPO_DIR, 'server.js');
 const MOCK_CLAUDE = path.join(REPO_DIR, 'scripts', 'mock-claude.js');
 const MOCK_CODEX = path.join(REPO_DIR, 'scripts', 'mock-codex.js');
+const MOCK_PI = path.join(REPO_DIR, 'scripts', 'mock-pi.js');
 
 function mkdirp(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -293,6 +294,45 @@ function createFakeCodexHistory(homeDir) {
   return { threadId, rolloutPath, stateDb, logsDb };
 }
 
+function createFakePiHistory(homeDir) {
+  const piRoot = path.join(homeDir, '.pi', 'agent');
+  const sessionsDir = path.join(piRoot, 'sessions', 'tmp-project-c');
+  mkdirp(sessionsDir);
+  fs.writeFileSync(path.join(piRoot, 'settings.json'), JSON.stringify({
+    defaultProvider: 'openai',
+    defaultModel: 'gpt-5.5',
+    defaultThinkingLevel: 'high',
+  }, null, 2));
+
+  const sessionId = 'pi-import-session';
+  const sessionPath = path.join(sessionsDir, `${sessionId}.jsonl`);
+  const lines = [
+    JSON.stringify({ type: 'session', version: 3, id: sessionId, cwd: '/tmp/project-c' }),
+    JSON.stringify({
+      type: 'model_change',
+      timestamp: '2026-03-12T00:00:00.000Z',
+      provider: 'openai',
+      modelId: 'gpt-5.5',
+    }),
+    JSON.stringify({
+      type: 'message',
+      timestamp: '2026-03-12T00:00:01.000Z',
+      message: { role: 'user', content: [{ type: 'text', text: 'Pi import prompt' }] },
+    }),
+    JSON.stringify({
+      type: 'message',
+      timestamp: '2026-03-12T00:00:02.000Z',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Pi import answer' }],
+        usage: { input: 30, cacheRead: 6, output: 10, cost: { total: 0.002 } },
+      },
+    }),
+  ];
+  fs.writeFileSync(sessionPath, `${lines.join('\n')}\n`);
+  return { sessionId, sessionPath };
+}
+
 async function main() {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-regression-'));
   const configDir = path.join(tempRoot, 'config');
@@ -315,6 +355,7 @@ async function main() {
 
   createFakeClaudeHistory(homeDir);
   const codexFixture = createFakeCodexHistory(homeDir);
+  const piFixture = createFakePiHistory(homeDir);
 
   const port = await getFreePort();
   const password = 'Regression!234';
@@ -328,6 +369,7 @@ async function main() {
     HOME: homeDir,
     CLAUDE_PATH: MOCK_CLAUDE,
     CODEX_PATH: MOCK_CODEX,
+    PI_PATH: MOCK_PI,
   }, async () => {
     const { ws, messages, token } = await connectWs(port, password);
 
@@ -481,6 +523,50 @@ async function main() {
 	      assert(/trigger codex context limit/.test(autoCompactRetry.text || ''), 'Codex auto /compact should replay the failed prompt after compact');
 	    }
 
+    const piInitCwd = path.join(tempRoot, 'pi-space');
+    mkdirp(piInitCwd);
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'pi', cwd: piInitCwd, mode: 'plan' }));
+    const piSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'pi' && msg.cwd === piInitCwd);
+    assert(piSession.mode === 'plan', 'Pi new_session should follow requested mode');
+    assert(piSession.model === 'openai/gpt-5.5:high', 'Pi new_session should read ~/.pi/agent/settings.json default model');
+
+    ws.send(JSON.stringify({ type: 'message', text: '/init', sessionId: piSession.sessionId, mode: 'plan', agent: 'pi' }));
+    const piInitStart = await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /AGENTS\.md/.test(msg.message || ''));
+    assert(/AGENTS\.md/.test(piInitStart.message || ''), 'Pi /init should announce AGENTS.md generation');
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === piSession.sessionId);
+    assert(fs.existsSync(path.join(piInitCwd, 'AGENTS.md')), 'Pi /init should generate AGENTS.md in the workspace');
+
+    ws.send(JSON.stringify({ type: 'message', text: '/model custom/pi-model:medium', sessionId: piSession.sessionId, mode: 'plan', agent: 'pi' }));
+    const piModelChanged = await nextMessage(messages, ws, (msg) => msg.type === 'model_changed' && msg.model === 'custom/pi-model:medium');
+    assert(piModelChanged.model === 'custom/pi-model:medium', 'Pi /model should accept provider/model:thinking names');
+
+    const piSessionPath = path.join(sessionsDir, `${piSession.sessionId}.json`);
+    const storedPiAfterInit = JSON.parse(fs.readFileSync(piSessionPath, 'utf8'));
+    const piSessionIdBeforeMode = storedPiAfterInit.piSessionId;
+    const piSessionFileBeforeMode = storedPiAfterInit.piSessionFile;
+    assert(piSessionIdBeforeMode, 'Pi session id should be persisted after first run');
+    assert(piSessionFileBeforeMode && fs.existsSync(piSessionFileBeforeMode), 'Pi session file should be persisted after first run');
+
+    ws.send(JSON.stringify({ type: 'set_mode', sessionId: piSession.sessionId, mode: 'yolo' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'mode_changed' && msg.mode === 'yolo');
+    const storedPiAfterMode = JSON.parse(fs.readFileSync(piSessionPath, 'utf8'));
+    assert(storedPiAfterMode.piSessionId === piSessionIdBeforeMode, 'Pi session id should survive mode switch');
+
+    ws.send(JSON.stringify({ type: 'message', text: 'pwd from pi', sessionId: piSession.sessionId, mode: 'plan', agent: 'pi' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === piSession.sessionId);
+    const piStoredAfterRun = JSON.parse(fs.readFileSync(piSessionPath, 'utf8'));
+    assert(piStoredAfterRun.totalUsage?.inputTokens > 0, 'Pi usage should be accumulated from runtime events');
+    const piProcessLog = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8');
+    const piSpawn = piProcessLog
+      .trim()
+      .split('\n')
+      .filter((line) => line.includes(`"event":"process_spawn"`) && line.includes(piSession.sessionId.slice(0, 8)))
+      .pop() || '';
+    assert(piSpawn.includes('--mode json') && piSpawn.includes('--session-dir'), 'Pi spawn should use JSON mode and isolated session dir');
+    assert(piSpawn.includes('--session') && piSpawn.includes(piSessionFileBeforeMode), 'Pi spawn should resume with session file path');
+    assert(piSpawn.includes('--tools read,grep,find,ls'), 'Pi plan mode should restrict tools');
+    assert(piSpawn.includes('--model custom/pi-model:medium'), 'Pi spawn should pass selected model');
+
     const claudeAttachment = await uploadAttachment(port, token, {
       filename: 'claude-test.png',
       mime: 'image/png',
@@ -540,6 +626,22 @@ async function main() {
     assert(!fs.existsSync(path.join(sessionsDir, `${importedSessionId}.json`)), 'Deleting Codex session did not remove session JSON');
     assert(!fs.existsSync(codexFixture.rolloutPath), 'Deleting Codex session did not remove rollout file');
     assert(sql(codexFixture.stateDb, `select count(*) from threads where id='${codexFixture.threadId}'`) === '0', 'Deleting Codex session did not remove thread row');
+
+    ws.send(JSON.stringify({ type: 'list_pi_sessions' }));
+    const piSessions = await nextMessage(messages, ws, (msg) => msg.type === 'pi_sessions');
+    const importedPiItem = piSessions.sessions.find((item) => item.sessionId === piFixture.sessionId);
+    assert(importedPiItem, 'Pi session listing failed');
+
+    ws.send(JSON.stringify({ type: 'import_pi_session', sessionId: importedPiItem.sessionId, sessionPath: importedPiItem.sessionPath }));
+    const importedPi = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'pi' && msg.title === 'Pi import prompt');
+    assert(importedPi.messages?.[0]?.content === 'Pi import prompt', 'Pi import parsed wrong first message');
+    assert(importedPi.totalUsage?.inputTokens === 30, 'Pi import usage parse failed');
+
+    const importedPiSessionId = importedPi.sessionId;
+    ws.send(JSON.stringify({ type: 'delete_session', sessionId: importedPiSessionId }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && !msg.sessions.some((s) => s.id === importedPiSessionId));
+    assert(!fs.existsSync(path.join(sessionsDir, `${importedPiSessionId}.json`)), 'Deleting Pi session did not remove session JSON');
+    assert(fs.existsSync(piFixture.sessionPath), 'Deleting imported Pi session should not remove native history');
 
     ws.close();
     console.log('Regression checks passed.');
